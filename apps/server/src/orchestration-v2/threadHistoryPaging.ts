@@ -163,7 +163,7 @@ export function decodeThreadHistoryCursor(cursor: string): ThreadHistoryCursorPa
   return parsed as ThreadHistoryCursorPayload;
 }
 
-export function isThreadHistoryTurnStart(item: HistoryRow["item"]): boolean {
+function isThreadHistoryTurnStart(item: HistoryRow["item"]): boolean {
   return (
     item.type === "user_message" &&
     (item.inputIntent === "turn_start" || item.inputIntent === "queued_turn")
