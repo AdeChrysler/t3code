@@ -121,8 +121,13 @@ the next goal turn on its own milliseconds after the last one completes, so the
 [adapter](../../apps/server/src/orchestration-v2/Adapters/CodexAdapterV2.ts) keeps the run open
 and adds that turn to it. One run can therefore own several native turns. `/goal` commands that
 start no Codex turn settle on a provider turn without a native ref, which native rollback must
-not count. Claude's SDK mode emits no goal events; its adapter reads goal state from the
-synthetic command output and Stop hook feedback in the transcript.
+not count. Claude's SDK mode emits no goal events, and only its session transcript records a
+verdict. The [adapter](../../apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.ts) gives
+the SDK a session store so the CLI mirrors that transcript on stdout, and takes Claude's
+`goal_status` records from it. The store loads nothing, so a resume still reads the CLI's own
+transcript. A launcher that moves `CLAUDE_CONFIG_DIR` behind the SDK's back gets no mirror; the
+adapter then reads the synthetic command output and Stop hook feedback, and infers a met goal
+when a turn ends with no background work left.
 
 Capabilities must describe what the provider can actually do. Antigravity can capture workspace
 checkpoints but cannot roll back its conversation. The [checkpoint boundary](./overview.md#turn-completion-and-checkpoints)

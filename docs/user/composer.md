@@ -244,6 +244,7 @@ row above the composer shows the goal and its progress.
   pauses it.
 - Stopping Claude ends the current turn, but the goal stays set. Claude checks it
   again at the end of your next message.
+- Claude ends a goal it judges impossible, and the goal row goes away.
 
 ## Context in your message
 

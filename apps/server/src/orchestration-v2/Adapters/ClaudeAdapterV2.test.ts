@@ -4,6 +4,7 @@ import * as NodeFS from "node:fs";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 import * as NodeStream from "node:stream";
+import * as NodeV8 from "node:v8";
 
 import type {
   Query as ClaudeQuery,
@@ -1937,15 +1938,25 @@ describe("ClaudeAdapterV2 native fork", () => {
 
 // Stands in for the Claude CLI behind the SDK's spawn hook: records how it was
 // started and answers stdin control requests, except mcp_set_servers if asked.
-function makeFakeClaudeCli(answerSetServers = true) {
+// `onPrompt` answers each user message with the frames it emits.
+function makeFakeClaudeCli(
+  answerSetServers = true,
+  onPrompt?: (emit: (frame: object) => void) => void,
+) {
   const spawns: Array<SpawnOptions> = [];
   const controlRequests: Array<object> = [];
   const stdins: Array<NodeStream.PassThrough> = [];
+  const stdouts: Array<NodeStream.PassThrough> = [];
+  // Writes one stdout frame of the latest process.
+  const emit = (frame: object) => {
+    stdouts.at(-1)?.write(`${JSON.stringify(frame)}\n`);
+  };
   const spawn = (options: SpawnOptions): SpawnedProcess => {
     spawns.push(options);
     const stdin = new NodeStream.PassThrough();
     const stdout = new NodeStream.PassThrough();
     stdins.push(stdin);
+    stdouts.push(stdout);
     const child = Object.assign(new NodeEvents.EventEmitter(), {
       stdin,
       stdout,
@@ -1963,6 +1974,7 @@ function makeFakeClaudeCli(answerSetServers = true) {
       for (let end = pending.indexOf("\n"); end >= 0; end = pending.indexOf("\n")) {
         const frame = JSON.parse(pending.slice(0, end));
         pending = pending.slice(end + 1);
+        if (frame.type === "user") onPrompt?.(emit);
         if (frame.type !== "control_request") continue;
         controlRequests.push(frame.request);
         const setServers = frame.request.subtype === "mcp_set_servers";
@@ -1983,7 +1995,7 @@ function makeFakeClaudeCli(answerSetServers = true) {
   };
   // The SDK closes the CLI by ending its stdin.
   const closed = () => stdins.length > 0 && stdins.every((stdin) => stdin.writableEnded);
-  return { spawn, spawns, controlRequests, closed };
+  return { spawn, spawns, controlRequests, closed, emit };
 }
 
 describe("ClaudeAdapterV2 MCP credential channel", () => {
@@ -2045,6 +2057,198 @@ describe("ClaudeAdapterV2 MCP credential channel", () => {
 
       assert.equal(opened._tag, "Failure");
       assert.isTrue(cli.closed());
+    }),
+  );
+});
+
+// The SDK's transcript mirror, end to end through its real query(): Claude Code
+// 2.1.299 writes `/goal` verdicts only to the session transcript, and emits
+// that transcript as `transcript_mirror` frames when a session store is set.
+describe("ClaudeAdapterV2 goal status mirror", () => {
+  // Never read or written: the fake CLI only names files under it.
+  const configDir = "/tmp/t3-claude-goal-mirror-config";
+  const nativeThreadId = "a1b2c3d4-0000-4000-8000-000000000001";
+  const projectDir = `${configDir}/projects/-tmp-goal-mirror`;
+  const transcript = `${projectDir}/${nativeThreadId}.jsonl`;
+  const condition = "the assistant has said pineapple in two separate turns";
+  const entry = (uuid: string, attachment: object, isSidechain = false) => ({
+    parentUuid: null,
+    isSidechain,
+    type: "attachment",
+    uuid,
+    timestamp: "2026-10-14T12:26:45.582Z",
+    entrypoint: "sdk-ts",
+    sessionId: nativeThreadId,
+    version: "2.1.299",
+    attachment,
+  });
+  const unmet = {
+    type: "goal_status",
+    met: false,
+    condition,
+    reason: "Only one assistant turn says pineapple.",
+  } as const;
+  const met = {
+    type: "goal_status",
+    met: true,
+    condition,
+    reason: "Two separate assistant turns say pineapple.",
+    iterations: 3,
+    durationMs: 14_310,
+    tokens: 2_048,
+  } as const;
+  const cleared = { type: "goal_status", met: true, sentinel: true, condition } as const;
+  const t3McpServer = { type: "http" as const, url: "http://127.0.0.1:43123/mcp" };
+  const openWith = (cli: ReturnType<typeof makeFakeClaudeCli>, resume = false) =>
+    Effect.gen(function* () {
+      const runner = yield* ClaudeAdapterV2.ClaudeAgentSdkQueryRunner;
+      return yield* runner.open({
+        threadId: ThreadId.make("thread-claude-goal-mirror"),
+        providerSessionId: ProviderSessionId.make("provider-session-claude-goal-mirror"),
+        options: {
+          ...ClaudeAdapterV2.makeClaudeQueryOptions({
+            modelSelection: CLAUDE_TEST_MODEL_SELECTION,
+            nativeThreadId,
+            resume,
+            cwd: null,
+            environment: { PATH: "/usr/bin", CLAUDE_CONFIG_DIR: configDir },
+            mcpServers: { "t3-code": t3McpServer },
+          }),
+          pathToClaudeCodeExecutable: "/opt/claude/cli.js",
+          spawnClaudeCodeProcess: cli.spawn,
+        },
+      });
+    }).pipe(
+      Effect.provide(ClaudeAdapterV2.layerQueryRunner),
+      Effect.provideService(
+        ProviderEventLoggers.ProviderEventLoggers,
+        ProviderEventLoggers.NoOpProviderEventLoggers,
+      ),
+      Effect.provide(NodeServices.layer),
+    );
+  const prompt: SDKUserMessage = {
+    type: "user",
+    message: { role: "user", content: "Say pineapple." },
+    parent_tool_use_id: null,
+  };
+
+  const resultFrame = {
+    type: "result",
+    subtype: "success",
+    is_error: false,
+    duration_ms: 1,
+    duration_api_ms: 1,
+    num_turns: 1,
+    result: "Pineapple.",
+    stop_reason: "end_turn",
+    total_cost_usd: 0,
+    usage: {},
+    modelUsage: {},
+    permission_denials: [],
+    uuid: "result-pineapple",
+    session_id: nativeThreadId,
+  };
+
+  it.effect("streams the root transcript's goal records ahead of the result they precede", () =>
+    Effect.gen(function* () {
+      const cli = makeFakeClaudeCli(true, (emit) => {
+        emit({
+          type: "assistant",
+          message: {
+            model: "claude-haiku-5-5",
+            id: "msg-pineapple",
+            type: "message",
+            role: "assistant",
+            content: [{ type: "text", text: "Pineapple." }],
+          },
+          parent_tool_use_id: null,
+          uuid: "assistant-pineapple",
+          session_id: nativeThreadId,
+        });
+        emit({
+          type: "transcript_mirror",
+          filePath: transcript,
+          entries: [
+            entry("hook-success", { type: "hook_success", hookName: "Stop" }),
+            entry("goal-unmet", unmet),
+          ],
+        });
+        // A subagent's transcript, and a sidechain entry in the root one.
+        emit({
+          type: "transcript_mirror",
+          filePath: `${projectDir}/${nativeThreadId}/subagents/agent-a1.jsonl`,
+          entries: [entry("subagent-goal", met)],
+        });
+        emit({
+          type: "transcript_mirror",
+          filePath: transcript,
+          entries: [entry("sidechain-goal", met, true), entry("goal-met", met)],
+        });
+        emit(resultFrame);
+      });
+      const session = yield* openWith(cli);
+      yield* session.offer(prompt);
+      const messages = yield* session.messages.pipe(
+        // Claude clears the goal while it is idle: nothing else follows.
+        Stream.tap((message) =>
+          Effect.sync(() => {
+            if (message.type !== "result") return;
+            cli.emit({
+              type: "transcript_mirror",
+              filePath: transcript,
+              entries: [entry("goal-cleared", cleared)],
+            });
+          }),
+        ),
+        Stream.take(5),
+        Stream.runCollect,
+      );
+      yield* session.close;
+
+      assert.include(cli.spawns[0]?.args ?? [], "--session-mirror");
+      const order = messages.map((message) =>
+        message.type === "goal_status_mirror"
+          ? { sessionId: message.sessionId, records: message.records }
+          : message.type,
+      );
+      // A record can overtake an SDK message read in the same tick, never
+      // the result it preceded.
+      assert.include(order, "assistant");
+      assert.deepEqual(
+        order.filter((message) => message !== "assistant"),
+        [
+          { sessionId: nativeThreadId, records: [unmet] },
+          { sessionId: nativeThreadId, records: [met] },
+          "result",
+          { sessionId: nativeThreadId, records: [cleared] },
+        ],
+      );
+    }),
+  );
+
+  // With a session store, the SDK asks it for the session before it spawns a
+  // resumed CLI. An empty answer leaves the CLI on its own transcript and
+  // config directory, and the MCP registration waits for the spawn.
+  it.effect("resumes from the CLI's own transcript and settings", () =>
+    Effect.gen(function* () {
+      const cli = makeFakeClaudeCli(true, (emit) => emit(resultFrame));
+      const session = yield* openWith(cli, true);
+      yield* session.offer(prompt);
+      const messages = yield* session.messages.pipe(Stream.take(1), Stream.runCollect);
+      yield* session.close;
+
+      assert.deepEqual(
+        messages.map((message) => message.type),
+        ["result"],
+      );
+      const spawned = cli.spawns[0];
+      assert.include(spawned?.args ?? [], `--resume=${nativeThreadId}`);
+      assert.include(spawned?.args ?? [], "--session-mirror");
+      assert.equal(spawned?.env.CLAUDE_CONFIG_DIR, configDir);
+      assert.deepInclude(cli.controlRequests, {
+        subtype: "mcp_set_servers",
+        servers: { "t3-code": t3McpServer },
+      });
     }),
   );
 });
@@ -2387,6 +2591,10 @@ describe("ClaudeAdapterV2 background wake turns", () => {
         yield* Queue.unbounded<
           Extract<ProviderAdapter.ProviderAdapterV2Event, { type: "turn_item.updated" }>
         >();
+      const providerThreadReceipts =
+        yield* Queue.unbounded<
+          Extract<ProviderAdapter.ProviderAdapterV2Event, { type: "provider_thread.updated" }>
+        >();
       let openedOptions: ClaudeAdapterV2.ClaudeAgentSdkQueryOptions | undefined;
       const adapter = yield* ClaudeAdapterV2.makeClaudeAdapterV2({
         instanceId: ClaudeAdapterV2.CLAUDE_DEFAULT_INSTANCE_ID,
@@ -2496,6 +2704,9 @@ describe("ClaudeAdapterV2 background wake turns", () => {
             if (event.type === "turn_item.updated" && event.turnItem.type === "system_notice") {
               yield* Queue.offer(systemNoticeReceipts, event);
             }
+            if (event.type === "provider_thread.updated") {
+              yield* Queue.offer(providerThreadReceipts, event);
+            }
           }),
         ),
         Effect.forkScoped,
@@ -2533,6 +2744,7 @@ describe("ClaudeAdapterV2 background wake turns", () => {
         terminalReceipts,
         subagentReceipts,
         systemNoticeReceipts,
+        providerThreadReceipts,
         getOpenedOptions: () => openedOptions,
         terminalEvents,
         hasPendingBackgroundWork,
@@ -14244,6 +14456,300 @@ describe("ClaudeAdapterV2 background wake turns", () => {
       ),
     );
 
+    // Claude's own `goal_status` records, as the transcript mirror delivers
+    // them (see "ClaudeAdapterV2 goal status mirror"). Sequences follow
+    // Claude Code 2.1.299 sessions: each unmet check is Stop hook feedback
+    // followed by its record; a skipped or failed check writes nothing.
+    const goalRecords = (
+      records: ReadonlyArray<ClaudeAdapterV2.ClaudeGoalStatusRecord>,
+      sessionId = WAKE_NATIVE_SESSION,
+    ) => claudeSdkFrame({ type: "goal_status_mirror", sessionId, records });
+    const goalSetRecord = (condition: string) =>
+      ({ type: "goal_status", met: false, sentinel: true, condition }) as const;
+    const goalClearedRecord = (condition: string) =>
+      ({ type: "goal_status", met: true, sentinel: true, condition }) as const;
+    const goalUnmetRecord = (condition: string, reason: string) =>
+      ({ type: "goal_status", met: false, condition, reason }) as const;
+    const goalMetRecord = (condition: string) =>
+      ({ type: "goal_status", met: true, condition, reason: "The condition holds." }) as const;
+    const goalTestLayer = Layer.mergeAll(
+      IdAllocator.layer,
+      McpProviderSessions.layer,
+      NodeServices.layer,
+    );
+    const startGoalTurn = (
+      harness: Effect.Success<typeof makeWakeHarness>,
+      input: {
+        readonly attempt: string;
+        readonly text: string;
+        readonly goal?: OrchestrationV2ProviderThread["goal"];
+      },
+    ) =>
+      Effect.gen(function* () {
+        yield* harness.runtime.startTurn(
+          makeClaudeTestTurnInput({
+            threadId: harness.threadId,
+            providerThread:
+              input.goal === undefined
+                ? harness.providerThread
+                : { ...harness.providerThread, goal: input.goal },
+            now: yield* DateTime.now,
+            attemptId: RunAttemptId.make(input.attempt),
+            text: input.text,
+            attachments: [],
+          }),
+        );
+      });
+    const offerAll = (
+      harness: Effect.Success<typeof makeWakeHarness>,
+      frames: ReadonlyArray<SDKMessage>,
+    ) => Effect.forEach(frames, (frame) => Queue.offer(harness.sdkMessages, frame));
+
+    it.effect("keeps a goal pursued when Claude's check writes no verdict", () =>
+      Effect.gen(function* () {
+        const harness = yield* makeWakeHarness;
+        const condition = "all tests pass";
+        yield* startGoalTurn(harness, {
+          attempt: "goal-mirror-error",
+          text: `/goal ${condition}`,
+        });
+        yield* offerAll(harness, [
+          syntheticFrame("goal-mirror-error-set", `Goal set: ${condition}`),
+          goalRecords([goalSetRecord(condition)]),
+          makeAssistantTextFrame({ uuid: "goal-mirror-error-work-1", text: "Fixing a test." }),
+          stopHookFeedback("goal-mirror-error-check", condition, "One test still fails."),
+          goalRecords([goalUnmetRecord(condition, "One test still fails.")]),
+          makeAssistantTextFrame({ uuid: "goal-mirror-error-work-2", text: "All tests pass." }),
+          // Another session's verdict, and then a turn end whose check
+          // errored: Claude writes no record for it.
+          goalRecords([goalMetRecord(condition)], "native-thread-other"),
+          makeResultFrame({ uuid: "goal-mirror-error-result", result: "All tests pass." }),
+        ]);
+        const terminal = yield* Queue.take(harness.terminalReceipts);
+        assert.equal(terminal.status, "completed");
+        // One check, counted once although both its feedback and its record arrived.
+        assert.deepEqual(goalStatuses(harness.events), [
+          { objective: condition, status: "active", checks: 0 },
+          {
+            objective: condition,
+            status: "active",
+            checks: 1,
+            lastCheck: "One test still fails.",
+          },
+          {
+            objective: condition,
+            status: "active",
+            checks: 1,
+            lastCheck: "One test still fails.",
+          },
+        ]);
+      }).pipe(Effect.scoped, Effect.provide(goalTestLayer)),
+    );
+
+    it.effect("completes a goal when Claude's met verdict arrives before the result", () =>
+      Effect.gen(function* () {
+        const harness = yield* makeWakeHarness;
+        const condition = "the word pineapple appears twice";
+        yield* startGoalTurn(harness, { attempt: "goal-mirror-met", text: `/goal ${condition}` });
+        yield* offerAll(harness, [
+          syntheticFrame("goal-mirror-met-set", `Goal set: ${condition}`),
+          goalRecords([goalSetRecord(condition)]),
+          makeAssistantTextFrame({ uuid: "goal-mirror-met-work-1", text: "Pineapple." }),
+          stopHookFeedback("goal-mirror-met-check", condition, "Only one turn says it."),
+          goalRecords([goalUnmetRecord(condition, "Only one turn says it.")]),
+          makeAssistantTextFrame({ uuid: "goal-mirror-met-work-2", text: "Pineapple again." }),
+          goalRecords([goalMetRecord(condition)]),
+          makeResultFrame({ uuid: "goal-mirror-met-result", result: "Pineapple again." }),
+        ]);
+        yield* Queue.take(harness.terminalReceipts);
+        // Complete when the verdict arrives, and still at the turn's end.
+        assert.deepEqual(goalStatuses(harness.events).slice(1), [
+          {
+            objective: condition,
+            status: "active",
+            checks: 1,
+            lastCheck: "Only one turn says it.",
+          },
+          { objective: condition, status: "complete", checks: 1 },
+          { objective: condition, status: "complete", checks: 1 },
+        ]);
+      }).pipe(Effect.scoped, Effect.provide(goalTestLayer)),
+    );
+
+    it.effect("completes a goal only on Claude's verdict after a background subagent", () =>
+      Effect.gen(function* () {
+        const harness = yield* makeWakeHarness;
+        const condition = "both reviewers find no bugs";
+        const taskId = "task-goal-mirror-subagent";
+        const now = yield* DateTime.now;
+        yield* startGoalTurn(harness, {
+          attempt: "goal-mirror-subagent",
+          text: `/goal ${condition}`,
+        });
+        yield* offerAll(harness, [
+          syntheticFrame("goal-mirror-subagent-set", `Goal set: ${condition}`),
+          goalRecords([goalSetRecord(condition)]),
+          ...backgroundAgentLaunchFrames({ prefix: "goal-mirror-subagent", taskId }),
+          makeAssistantTextFrame({
+            uuid: "goal-mirror-subagent-wait",
+            text: "Waiting for the reviewers.",
+          }),
+          makeResultFrame({
+            uuid: "goal-mirror-subagent-result",
+            result: "Waiting for the reviewers.",
+          }),
+        ]);
+        yield* Queue.take(harness.terminalReceipts);
+        assert.equal(goalStatuses(harness.events).at(-1)?.status, "active");
+
+        yield* harness.offerAndWait(
+          claudeSdkFrame({
+            type: "system",
+            subtype: "task_notification",
+            task_id: taskId,
+            tool_use_id: "toolu-goal-mirror-subagent",
+            status: "completed",
+            output_file: `/tmp/${taskId}.output`,
+            summary: "No bugs found.",
+            uuid: "goal-mirror-subagent-notification",
+            session_id: WAKE_NATIVE_SESSION,
+          }),
+        );
+        yield* harness.offerAndWait(backgroundTasksLevel("goal-mirror-subagent-level", []));
+        yield* harness.offerAndWait(wakeTurnInit);
+        yield* harness.runtime.startTurn(
+          makeClaudeTestTurnInput({
+            threadId: harness.threadId,
+            providerThread: harness.providerThread,
+            now,
+            attemptId: RunAttemptId.make("goal-mirror-subagent-wake"),
+            text: "Background task completed.",
+            attachments: [],
+            providerTurnOrdinal: 2,
+            messageCreatedBy: "agent",
+            messageCreationSource: "provider",
+          }),
+        );
+        yield* harness.offerAndWait(
+          makeAssistantTextFrame({ uuid: "goal-mirror-subagent-wake-work", text: "No bugs." }),
+        );
+        yield* harness.offerAndWait(
+          makeResultFrame({
+            uuid: "goal-mirror-subagent-wake-result",
+            result: "No bugs.",
+            origin: { kind: "task-notification" },
+          }),
+        );
+        yield* Queue.take(harness.terminalReceipts);
+        // Nothing running and the turn ended, but Claude has not said so yet.
+        assert.equal(goalStatuses(harness.events).at(-1)?.status, "active");
+
+        // The verdict lands while Claude is idle.
+        yield* Queue.clear(harness.providerThreadReceipts);
+        yield* harness.offerAndWait(goalRecords([goalMetRecord(condition)]));
+        const update = yield* Queue.take(harness.providerThreadReceipts);
+        assert.deepEqual(update.providerThread.goal, {
+          objective: condition,
+          status: "complete",
+          checks: 0,
+        });
+      }).pipe(Effect.scoped, Effect.provide(goalTestLayer)),
+    );
+
+    // Claude drops a goal it judges impossible. Resume would send
+    // `/goal resume`, which Claude reads as a new goal, so T3 shows no goal.
+    it.effect("drops a goal Claude judges impossible", () =>
+      Effect.gen(function* () {
+        const harness = yield* makeWakeHarness;
+        const condition = "the moon is made of cheese";
+        yield* startGoalTurn(harness, {
+          attempt: "goal-mirror-impossible",
+          text: `/goal ${condition}`,
+        });
+        yield* offerAll(harness, [
+          syntheticFrame("goal-mirror-impossible-set", `Goal set: ${condition}`),
+          goalRecords([goalSetRecord(condition)]),
+          makeAssistantTextFrame({ uuid: "goal-mirror-impossible-work", text: "It is rock." }),
+          goalRecords([
+            {
+              type: "goal_status",
+              met: false,
+              failed: true,
+              condition,
+              reason: "The moon is rock; no work can change that.",
+            },
+          ]),
+          makeResultFrame({ uuid: "goal-mirror-impossible-result", result: "It is rock." }),
+        ]);
+        yield* Queue.take(harness.terminalReceipts);
+        const updates = harness.events.flatMap((event) =>
+          event.type === "provider_thread.updated" ? [event.providerThread.goal] : [],
+        );
+        assert.isNull(updates.at(-1));
+        assert.notInclude(
+          goalStatuses(harness.events).map((goal) => goal.status),
+          "complete",
+        );
+      }).pipe(Effect.scoped, Effect.provide(goalTestLayer)),
+    );
+
+    // A complete goal can come from an earlier inference, or from a version
+    // that inferred more. Claude's next unmet check puts it back.
+    it.effect("returns a complete goal to active when Claude's next check finds it unmet", () =>
+      Effect.gen(function* () {
+        const harness = yield* makeWakeHarness;
+        const condition = "the docs build";
+        yield* startGoalTurn(harness, {
+          attempt: "goal-mirror-reopen",
+          text: "Keep going.",
+          goal: { objective: condition, status: "complete", checks: 1 },
+        });
+        yield* offerAll(harness, [
+          // This process's first mirror batch holds no goal record.
+          goalRecords([]),
+          makeAssistantTextFrame({ uuid: "goal-mirror-reopen-work-1", text: "Building." }),
+          stopHookFeedback("goal-mirror-reopen-check", condition, "The build fails."),
+          goalRecords([goalUnmetRecord(condition, "The build fails.")]),
+          makeAssistantTextFrame({ uuid: "goal-mirror-reopen-work-2", text: "Fixed it." }),
+          makeResultFrame({ uuid: "goal-mirror-reopen-result", result: "Fixed it." }),
+        ]);
+        yield* Queue.take(harness.terminalReceipts);
+        assert.deepEqual(goalStatuses(harness.events).at(-1), {
+          objective: condition,
+          status: "active",
+          checks: 2,
+          lastCheck: "The build fails.",
+        });
+      }).pipe(Effect.scoped, Effect.provide(goalTestLayer)),
+    );
+
+    it.effect("resets on a new goal and drops a goal Claude clears", () =>
+      Effect.gen(function* () {
+        const harness = yield* makeWakeHarness;
+        const previous = "the old objective";
+        const condition = "the release notes are written";
+        yield* startGoalTurn(harness, {
+          attempt: "goal-mirror-clear",
+          text: `/goal ${condition}`,
+          goal: { objective: previous, status: "active", checks: 3, lastCheck: "Not yet." },
+        });
+        yield* offerAll(harness, [
+          syntheticFrame("goal-mirror-clear-set", `Goal set: ${condition}`),
+          goalRecords([goalSetRecord(condition)]),
+          makeAssistantTextFrame({ uuid: "goal-mirror-clear-work", text: "Writing notes." }),
+          // Claude clears a goal itself on auth, credit or context errors.
+          goalRecords([goalClearedRecord(condition)]),
+          makeResultFrame({ uuid: "goal-mirror-clear-result", result: "Writing notes." }),
+        ]);
+        yield* Queue.take(harness.terminalReceipts);
+        const goals = harness.events.flatMap((event) =>
+          event.type === "provider_thread.updated" ? [event.providerThread.goal] : [],
+        );
+        assert.deepInclude(goals, { objective: condition, status: "active", checks: 0 });
+        assert.isNull(goals.at(-1));
+      }).pipe(Effect.scoped, Effect.provide(goalTestLayer)),
+    );
+
     it.effect("keeps a goal active after a command turn with no model output", () =>
       Effect.gen(function* () {
         const harness = yield* makeWakeHarness;
@@ -14286,54 +14792,122 @@ describe("ClaudeAdapterV2 background wake turns", () => {
 });
 
 describe("ClaudeAdapterV2 query message stream", () => {
-  it.effect("closes the query when the message stream is interrupted mid-read", () =>
-    Effect.gen(function* () {
-      let closed = false;
-      let releaseRead = () => {};
-      const readStarted = Promise.withResolvers<void>();
-      // Never yields a message — the read stays pending until close() flips
-      // `closed` and releases the in-flight await.
-      // oxlint-disable-next-line require-yield
-      async function* sdkMessages(): AsyncGenerator<SDKMessage, void> {
-        for (;;) {
-          if (closed) return;
-          await new Promise<void>((resolve) => {
-            releaseRead = resolve;
-            readStarted.resolve();
-          });
+  it.effect.each([{ mirror: "without" }, { mirror: "with" }])(
+    "closes the query when the message stream is interrupted mid-read $mirror a goal mirror",
+    ({ mirror }) =>
+      Effect.gen(function* () {
+        const goalStatusMirror =
+          mirror === "with" ? ClaudeAdapterV2.makeClaudeGoalStatusMirror() : undefined;
+        let closed = false;
+        let releaseRead = () => {};
+        const readStarted = Promise.withResolvers<void>();
+        // Never yields a message — the read stays pending until close() flips
+        // `closed` and releases the in-flight await.
+        // oxlint-disable-next-line require-yield
+        async function* sdkMessages(): AsyncGenerator<SDKMessage, void> {
+          for (;;) {
+            if (closed) return;
+            await new Promise<void>((resolve) => {
+              releaseRead = resolve;
+              readStarted.resolve();
+            });
+          }
         }
-      }
-      const generator = sdkMessages();
-      const close = () => {
-        closed = true;
-        releaseRead();
-      };
-      const query = {
-        next: () => generator.next(),
-        return: async (value?: void) => {
-          close();
-          return generator.return(value);
-        },
-        throw: (error?: unknown) => generator.throw(error),
-        [Symbol.asyncIterator]: () => generator,
-        close,
-      } as unknown as ClaudeQuery;
+        const generator = sdkMessages();
+        const close = () => {
+          closed = true;
+          releaseRead();
+        };
+        const query = {
+          next: () => generator.next(),
+          return: async (value?: void) => {
+            close();
+            return generator.return(value);
+          },
+          throw: (error?: unknown) => generator.throw(error),
+          [Symbol.asyncIterator]: () => generator,
+          close,
+        } as unknown as ClaudeQuery;
 
-      const scope = yield* Scope.make();
-      yield* Stream.fromAsyncIterable(
-        ClaudeAdapterV2.claudeQueryMessages(query),
-        (cause) => cause,
-      ).pipe(
-        Stream.runForEach(() => Effect.void),
-        Effect.forkIn(scope),
-      );
-      yield* Effect.promise(() => readStarted.promise);
+        const scope = yield* Scope.make();
+        yield* Stream.fromAsyncIterable(
+          ClaudeAdapterV2.claudeQueryMessages(query, goalStatusMirror),
+          (cause) => cause,
+        ).pipe(
+          Stream.runForEach(() => Effect.void),
+          Effect.forkIn(scope),
+        );
+        yield* Effect.promise(() => readStarted.promise);
 
-      // Iterating query[Symbol.asyncIterator]() directly deadlocks here:
-      // the raw generator's return() queues behind the in-flight read and
-      // scope close never completes.
-      yield* Scope.close(scope, Exit.void);
-      assert.isTrue(closed);
-    }),
+        // Iterating query[Symbol.asyncIterator]() directly deadlocks here:
+        // the raw generator's return() queues behind the in-flight read and
+        // scope close never completes.
+        yield* Scope.close(scope, Exit.void);
+        assert.isTrue(closed);
+      }),
   );
+
+  // The SDK flushes the mirror before it ends the stream, so a record that
+  // lands with the end still reaches the adapter.
+  it("delivers a goal record that arrives with the end of the stream", async () => {
+    const mirror = ClaudeAdapterV2.makeClaudeGoalStatusMirror();
+    const met = { type: "goal_status", met: true, condition: "the docs build" } as const;
+    const query = {
+      next: async () => {
+        await mirror.sessionStore.append({ projectKey: "p", sessionId: "s" }, [
+          { type: "attachment", attachment: met },
+        ]);
+        return { done: true, value: undefined };
+      },
+      return: async () => ({ done: true, value: undefined }),
+    } as unknown as ClaudeQuery;
+    const messages: Array<ClaudeAdapterV2.ClaudeQueryMessage> = [];
+    for await (const message of ClaudeAdapterV2.claudeQueryMessages(query, mirror)) {
+      messages.push(message);
+    }
+
+    assert.deepEqual(messages, [{ type: "goal_status_mirror", sessionId: "s", records: [met] }]);
+  });
+
+  // A session without a goal never gets a goal record, and T3 reads one SDK
+  // message per streamed token, so what the stream keeps must not grow with
+  // the messages it reads. Counts live promises after a full collection.
+  it("keeps nothing per message while the mirror delivers no goal record", async () => {
+    let sent = 0;
+    const query = {
+      next: () =>
+        new Promise<IteratorResult<SDKMessage, void>>((resolve) =>
+          setImmediate(() => resolve({ done: false, value: claudeStreamEventFrame(sent++) })),
+        ),
+      return: async () => ({ done: true, value: undefined }),
+    } as unknown as ClaudeQuery;
+    const mirror = ClaudeAdapterV2.makeClaudeGoalStatusMirror();
+    // The process's first root batch confirms the mirror; no record follows.
+    await mirror.sessionStore.append({ projectKey: "p", sessionId: "s" }, [{ type: "user" }]);
+    const messages = ClaudeAdapterV2.claudeQueryMessages(query, mirror)[Symbol.asyncIterator]();
+    const read = async (count: number) => {
+      for (let index = 0; index < count; index += 1) await messages.next();
+    };
+
+    await read(1_000);
+    const before = NodeV8.queryObjects(Promise, { format: "count" });
+    await read(10_000);
+    const after = NodeV8.queryObjects(Promise, { format: "count" });
+
+    assert.isBelow(after - before, 1_000);
+  });
 });
+
+function claudeStreamEventFrame(index: number): SDKMessage {
+  return {
+    type: "stream_event",
+    event: {
+      type: "content_block_delta",
+      index: 0,
+      delta: { type: "text_delta", text: `${index}` },
+    },
+    parent_tool_use_id: null,
+    uuid: `00000000-0000-4000-8000-${index.toString().padStart(12, "0")}`,
+    session_id: "s",
+  } as SDKMessage;
+}

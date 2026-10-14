@@ -28,6 +28,7 @@ import {
   type PermissionResult,
   type PermissionUpdate,
   type Query as ClaudeQuery,
+  type SessionStore,
   type Settings as ClaudeSdkSettings,
   type SpawnOptions as ClaudeSpawnOptions,
   type SpawnedProcess as ClaudeSpawnedProcess,
@@ -414,8 +415,39 @@ export interface ClaudeAgentSdkQueryOpenInput {
   readonly providerSessionId: OrchestrationV2ProviderSession["id"];
 }
 
+// Claude Code's transcript record for `/goal`. The CLI writes it to the session
+// transcript only; the SDK types do not declare it.
+const ClaudeGoalStatusEntry = Schema.Struct({
+  type: Schema.Literal("attachment"),
+  isSidechain: Schema.optional(Schema.Boolean),
+  attachment: Schema.Struct({
+    type: Schema.Literal("goal_status"),
+    condition: Schema.String,
+    met: Schema.Boolean,
+    sentinel: Schema.optional(Schema.Boolean),
+    failed: Schema.optional(Schema.Boolean),
+    reason: Schema.optional(Schema.String),
+  }),
+});
+const isClaudeGoalStatusEntry = Schema.is(ClaudeGoalStatusEntry);
+export type ClaudeGoalStatusRecord = (typeof ClaudeGoalStatusEntry.Type)["attachment"];
+
+/**
+ * The `/goal` records Claude wrote to the root session transcript, which reach
+ * T3 only through the SDK's transcript mirror. A process's first one may hold
+ * no record: it shows that the mirror works for that process.
+ */
+export interface ClaudeGoalStatusMirrorMessage {
+  readonly type: "goal_status_mirror";
+  readonly sessionId: string;
+  readonly records: ReadonlyArray<ClaudeGoalStatusRecord>;
+}
+
+/** What a query session streams: the SDK's messages and mirrored goal records. */
+export type ClaudeQueryMessage = SDKMessage | ClaudeGoalStatusMirrorMessage;
+
 export interface ClaudeAgentSdkQuerySession {
-  readonly messages: Stream.Stream<SDKMessage, ClaudeAgentSdkQueryRunnerError>;
+  readonly messages: Stream.Stream<ClaudeQueryMessage, ClaudeAgentSdkQueryRunnerError>;
   readonly offer: (message: SDKUserMessage) => Effect.Effect<void, ClaudeAgentSdkQueryRunnerError>;
   readonly setModel: (model: string) => Effect.Effect<void, ClaudeAgentSdkQueryRunnerError>;
   readonly applyFlagSettings: (
@@ -508,14 +540,98 @@ function closeClaudeQuery(queryRuntime: ClaudeQuery) {
   });
 }
 
+export interface ClaudeGoalStatusMirror {
+  /** The SDK `sessionStore` that receives one CLI process's transcript mirror. */
+  readonly sessionStore: SessionStore;
+  readonly take: () => ClaudeGoalStatusMirrorMessage | undefined;
+  /**
+   * Settles when the next message arrives. Only the latest call is kept, so a
+   * reader that waits again drops its earlier, unsettled wait.
+   */
+  readonly arrival: () => Promise<void>;
+}
+
+/**
+ * Keeps the `/goal` records of one CLI process's transcript mirror. Claude
+ * reports a goal's verdict nowhere else in SDK mode. Subagent transcripts
+ * arrive under a subpath and are ignored.
+ */
+export function makeClaudeGoalStatusMirror(): ClaudeGoalStatusMirror {
+  const pending: Array<ClaudeGoalStatusMirrorMessage> = [];
+  // One waiter at a time: most sessions never get a goal record, and every
+  // reaction parked on a promise that never settles would stay for the
+  // process's lifetime.
+  let waiter: PromiseWithResolvers<void> | undefined;
+  let confirmed = false;
+  return {
+    sessionStore: {
+      append: async (key, entries) => {
+        if (key.subpath !== undefined) return;
+        const records = entries.flatMap((entry) =>
+          isClaudeGoalStatusEntry(entry) && entry.isSidechain !== true ? [entry.attachment] : [],
+        );
+        if (records.length === 0 && confirmed) return;
+        confirmed = true;
+        pending.push({ type: "goal_status_mirror", sessionId: key.sessionId, records });
+        waiter?.resolve();
+        waiter = undefined;
+      },
+      // Nothing is stored here, so a resume reads the CLI's own transcript.
+      load: async () => null,
+    },
+    take: () => pending.shift(),
+    arrival: () => {
+      waiter = Promise.withResolvers<void>();
+      return waiter.promise;
+    },
+  };
+}
+
 // Iterate the Query itself, not query[Symbol.asyncIterator]() (the raw
 // sdkMessages generator). The raw generator's return() queues behind the
 // in-flight read of the next CLI message and never settles while the CLI is
 // idle, deadlocking stream interruption (and with it, session scope close).
 // Query.return() runs cleanup() first, which closes the transport and
 // unblocks that read.
-export function claudeQueryMessages(queryRuntime: ClaudeQuery): AsyncIterable<SDKMessage, void> {
-  return { [Symbol.asyncIterator]: () => queryRuntime };
+//
+// Mirrored goal records join the stream as soon as the store receives them,
+// so one that lands while the CLI is idle is read at once. The SDK hands a
+// turn's mirror batches to the store before it yields that turn's result, so
+// a record never follows the result it preceded. It can overtake an SDK
+// message read in the same tick.
+export function claudeQueryMessages(
+  queryRuntime: ClaudeQuery,
+  goalStatusMirror?: ClaudeGoalStatusMirror,
+): AsyncIterable<ClaudeQueryMessage, void> {
+  if (goalStatusMirror === undefined) {
+    return { [Symbol.asyncIterator]: () => queryRuntime };
+  }
+  return {
+    [Symbol.asyncIterator]: () => {
+      let read: Promise<IteratorResult<SDKMessage, void>> | undefined;
+      return {
+        next: async () => {
+          for (;;) {
+            const mirrored = goalStatusMirror.take();
+            if (mirrored !== undefined) return { done: false, value: mirrored };
+            const arrival = goalStatusMirror.arrival();
+            const current = (read ??= queryRuntime.next());
+            const sdkFirst = await Promise.race([
+              current.then(() => true),
+              arrival.then(() => false),
+            ]);
+            if (sdkFirst) {
+              const next = goalStatusMirror.take();
+              if (next !== undefined) return { done: false, value: next };
+              read = undefined;
+              return current;
+            }
+          }
+        },
+        return: (value) => queryRuntime.return(value),
+      };
+    },
+  };
 }
 
 export interface ClaudeAgentSdkLoggedQueryOptions {
@@ -639,7 +755,7 @@ export type ClaudeAgentSdkProtocolLogEvent =
   | {
       readonly direction: "incoming";
       readonly stage: "decoded";
-      readonly payload: SDKMessage;
+      readonly payload: ClaudeQueryMessage;
     };
 
 export type ClaudeAgentSdkProtocolLogger = (
@@ -768,6 +884,12 @@ export const layerQueryRunner: Layer.Layer<
         const spawnClaudeCodeProcess =
           options.spawnClaudeCodeProcess ??
           (platform === "win32" ? undefined : spawnClaudeProcessGroup);
+        // The SDK refuses a mirror without local transcript writes or with
+        // file checkpointing; both are off unless a caller opts in.
+        const goalStatusMirror =
+          options.persistSession === false || options.enableFileCheckpointing === true
+            ? undefined
+            : makeClaudeGoalStatusMirror();
         // The CLI is running once query() returns, so it is closed if anything
         // before the session is handed out fails or is interrupted.
         const queryRuntime = yield* Effect.uninterruptibleMask((restore) =>
@@ -775,10 +897,13 @@ export const layerQueryRunner: Layer.Layer<
             try: () =>
               query({
                 prompt,
-                options:
-                  spawnClaudeCodeProcess === undefined
-                    ? options
-                    : { ...options, spawnClaudeCodeProcess },
+                options: {
+                  ...options,
+                  ...(spawnClaudeCodeProcess === undefined ? {} : { spawnClaudeCodeProcess }),
+                  ...(goalStatusMirror === undefined
+                    ? {}
+                    : { sessionStore: goalStatusMirror.sessionStore, sessionStoreFlush: "eager" }),
+                },
               }),
             catch: (cause) => queryRunnerError(cause, "query"),
           }).pipe(
@@ -835,8 +960,9 @@ export const layerQueryRunner: Layer.Layer<
         );
 
         return {
-          messages: Stream.fromAsyncIterable(claudeQueryMessages(queryRuntime), (cause) =>
-            queryRunnerError(cause, "fromAsyncIterable"),
+          messages: Stream.fromAsyncIterable(
+            claudeQueryMessages(queryRuntime, goalStatusMirror),
+            (cause) => queryRunnerError(cause, "fromAsyncIterable"),
           ).pipe(
             Stream.tap((message) =>
               logProtocolEvent({
@@ -1277,17 +1403,22 @@ function textFromClaudeContent(content: SDKAssistantMessage["message"]["content"
 
 // In SDK mode Claude reports `/goal` only through the transcript (its
 // `active_goal` event is remote-only): synthetic command output names the
-// goal, and each unmet evaluator check returns as Stop hook feedback.
+// goal, and each unmet evaluator check returns as Stop hook feedback. The
+// verdicts themselves are `goal_status` records, which only the transcript
+// mirror delivers (see nextClaudeGoalFromRecord).
 const CLAUDE_GOAL_SET_PREFIX = "Goal set: ";
 const CLAUDE_GOAL_ACTIVE = /^Goal active: ([\s\S]+?) \((?:not yet evaluated|(\d+) turns?)\)/u;
 
 /**
  * The goal after one root SDK frame, or undefined when the frame says nothing
- * about it. Completion has no frame of its own; see finalizeActiveTurn.
+ * about it. Completion has no frame of its own; see finalizeActiveTurn. Once
+ * the mirror delivers goal records, they count the checks instead of Stop
+ * hook feedback, which reports the same checks.
  */
 function nextClaudeGoal(
   current: OrchestrationV2ProviderGoal | null,
   message: SDKMessage,
+  goalStatusMirrored: boolean,
 ): OrchestrationV2ProviderGoal | null | undefined {
   if (message.type === "assistant") {
     if (message.parent_tool_use_id !== null || message.message.model !== "<synthetic>") {
@@ -1309,6 +1440,7 @@ function nextClaudeGoal(
     };
   }
   if (
+    goalStatusMirrored ||
     message.type !== "user" ||
     message.parent_tool_use_id !== null ||
     message.isSynthetic !== true ||
@@ -1329,6 +1461,34 @@ function nextClaudeGoal(
     checks: (current.checks ?? 0) + 1,
     lastCheck: text.slice(prefix.length).trim(),
   };
+}
+
+/**
+ * The goal after one `goal_status` record from the root session transcript.
+ * Claude writes one when a goal is set or cleared (a `sentinel` record), after
+ * each check that finds it unmet, and when it judges the goal met or
+ * impossible. A check it skips (background work still running) or that fails
+ * to run writes nothing, so the goal stays as it was.
+ */
+function nextClaudeGoalFromRecord(
+  current: OrchestrationV2ProviderGoal | null,
+  record: ClaudeGoalStatusRecord,
+): OrchestrationV2ProviderGoal | null {
+  const objective = record.condition.trim();
+  if (objective.length === 0) return current;
+  // Cleared, including the clears Claude makes itself on auth, credit or
+  // context errors.
+  if (record.sentinel === true) {
+    return record.met ? null : { objective, status: "active", checks: 0 };
+  }
+  // Impossible: Claude drops the goal, as on a clear. T3 has no Claude status
+  // for it, and the statuses that offer Resume would send `/goal resume`,
+  // which Claude reads as a new goal.
+  if (record.failed === true) return null;
+  const checks = current?.objective === objective ? (current.checks ?? 0) : 0;
+  if (record.met) return { objective, status: "complete", checks };
+  if (record.reason === undefined) return current;
+  return { objective, status: "active", checks: checks + 1, lastCheck: record.reason.trim() };
 }
 
 const providerGoalsEqual = Schema.toEquivalence(Schema.NullOr(OrchestrationV2ProviderGoal));
@@ -3118,6 +3278,9 @@ interface ClaudeLiveQueryContext {
   permissionMode: PermissionMode;
   // Stop, rollback or fork is closing this process; its work is ending.
   stopping: boolean;
+  // This process's transcript mirror delivers Claude's own `/goal` records,
+  // so they alone move the goal (see applyMirroredClaudeGoal).
+  goalStatusMirrored: boolean;
   // Registry entries still running when this process opened. Their process
   // is gone and never reports their end; any later task_started replaces the
   // entry, so an entry still in this set runs nowhere.
@@ -4024,26 +4187,15 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
           });
         });
 
-        /** Applies one root frame's goal signal and writes any change onto the provider thread. */
-        const trackClaudeGoal = Effect.fnUntraced(function* (input: {
-          readonly nativeThreadId: string;
-          readonly context: ActiveClaudeTurnContext;
-          readonly message: SDKMessage;
-        }) {
-          const current = goalsByNativeThread.get(input.nativeThreadId) ?? null;
-          if (
-            current?.status === "active" &&
-            input.message.type === "assistant" &&
-            input.message.parent_tool_use_id === null &&
-            input.message.message.model !== "<synthetic>"
-          ) {
-            goalCheckedTurns.add(input.context.providerTurnId);
-          }
-          const next = nextClaudeGoal(current, input.message);
-          if (next === undefined || providerGoalsEqual(current, next)) return;
-          goalsByNativeThread.set(input.nativeThreadId, next);
+        /** Records a native thread's goal and writes any change onto its provider thread. */
+        const writeClaudeGoal = Effect.fnUntraced(function* (
+          nativeThreadId: string,
+          next: OrchestrationV2ProviderGoal | null,
+        ) {
+          if (providerGoalsEqual(goalsByNativeThread.get(nativeThreadId) ?? null, next)) return;
+          goalsByNativeThread.set(nativeThreadId, next);
           const providerThread = (yield* Ref.get(lastProviderThreadByNativeThread)).get(
-            input.nativeThreadId,
+            nativeThreadId,
           );
           if (providerThread === undefined) return;
           const updated = { ...providerThread, goal: next, updatedAt: yield* DateTime.now };
@@ -4053,6 +4205,52 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             driver: CLAUDE_PROVIDER,
             providerThread: updated,
           });
+        });
+
+        /** Applies one root frame's goal signal and writes any change onto the provider thread. */
+        const trackClaudeGoal = Effect.fnUntraced(function* (input: {
+          readonly live: ClaudeLiveQueryContext;
+          readonly context: ActiveClaudeTurnContext;
+          readonly message: SDKMessage;
+        }) {
+          const current = goalsByNativeThread.get(input.live.nativeThreadId) ?? null;
+          if (
+            current?.status === "active" &&
+            input.message.type === "assistant" &&
+            input.message.parent_tool_use_id === null &&
+            input.message.message.model !== "<synthetic>"
+          ) {
+            goalCheckedTurns.add(input.context.providerTurnId);
+          }
+          const next = nextClaudeGoal(current, input.message, input.live.goalStatusMirrored);
+          if (next !== undefined) yield* writeClaudeGoal(input.live.nativeThreadId, next);
+        });
+
+        /**
+         * Applies the `/goal` records a process's transcript mirror delivered,
+         * whenever they arrive, including after the turn they belong to ended.
+         * From then on they alone decide the goal for that process: Claude
+         * writes a record for every verdict, so a turn end without one is a
+         * check that was skipped or failed, not a met goal.
+         */
+        const applyMirroredClaudeGoal = Effect.fnUntraced(function* (
+          live: ClaudeLiveQueryContext,
+          message: ClaudeGoalStatusMirrorMessage,
+        ) {
+          if (
+            (yield* Ref.get(queryContext))?.query !== live.query ||
+            message.sessionId !== live.nativeThreadId
+          ) {
+            return;
+          }
+          live.goalStatusMirrored = true;
+          yield* writeClaudeGoal(
+            live.nativeThreadId,
+            message.records.reduce(
+              nextClaudeGoalFromRecord,
+              goalsByNativeThread.get(live.nativeThreadId) ?? null,
+            ),
+          );
         });
 
         const rememberOpaqueTasks = (tasks: ReadonlyArray<OrchestrationV2PendingBackgroundTask>) =>
@@ -6083,13 +6281,13 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                 const clearConversationHead =
                   input.status === "completed" &&
                   input.context.input.providerThread.nativeConversationHeadRef !== null;
-                // While a goal is set, Claude ends a turn on its own only after the
-                // goal's Stop hook passes. It defers that check while background
-                // work of the types it waits on runs (subagents stay off the roster;
-                // see CLAUDE_GOAL_DEFERRING_TASK_TYPES), and a hook that stops the
-                // turn reports another reason.
-                // SDK mode does not report an evaluator timeout or an impossible
-                // verdict, so those still read as complete.
+                // Without a transcript mirror (see applyMirroredClaudeGoal), a met
+                // goal is inferred: while a goal is set, Claude ends a turn on its
+                // own only after the goal's Stop hook passes. It defers that check
+                // while background work of the types it waits on runs (subagents
+                // stay off the roster; see CLAUDE_GOAL_DEFERRING_TASK_TYPES), and
+                // a hook that stops the turn reports another reason. An evaluator
+                // timeout or an impossible verdict still reads as complete there.
                 const goal =
                   nativeThreadId === null ? undefined : goalsByNativeThread.get(nativeThreadId);
                 const goalChecked = goalCheckedTurns.delete(input.context.providerTurnId);
@@ -6101,6 +6299,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                   goalChecked &&
                   input.status === "completed" &&
                   (terminalReason === undefined || terminalReason === "completed") &&
+                  !(liveQuery?.nativeThreadId === nativeThreadId && liveQuery.goalStatusMirrored) &&
                   roster.size === 0 &&
                   !(
                     liveQuery?.nativeThreadId === nativeThreadId &&
@@ -6924,7 +7123,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             }
             return;
           }
-          yield* trackClaudeGoal({ nativeThreadId: liveQuery.nativeThreadId, context, message });
+          yield* trackClaudeGoal({ live: liveQuery, context, message });
 
           // Subagent narration belongs to its child thread, never the parent log.
           if (message.type === "stream_event" && !message.parent_tool_use_id) {
@@ -8608,6 +8807,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             openedPermissionMode: queryOptions.permissionMode,
             permissionMode: queryOptions.permissionMode,
             stopping: false,
+            goalStatusMirrored: false,
             subagentsFromEarlierProcesses: new Set(
               [...(yield* Ref.get(sessionSubagentsByTaskId)).values()].filter(
                 (subagent) => subagent.task.status === "running",
@@ -8619,6 +8819,9 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             Stream.runForEach((message) =>
               sdkMessageLock.withPermits(1)(
                 Effect.suspend(() => {
+                  if (message.type === "goal_status_mirror") {
+                    return applyMirroredClaudeGoal(context, message);
+                  }
                   if (
                     message.type === "system" &&
                     (message.subtype === "init" || message.subtype === "status") &&
