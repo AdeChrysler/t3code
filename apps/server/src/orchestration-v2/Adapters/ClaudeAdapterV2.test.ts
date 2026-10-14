@@ -14010,6 +14010,22 @@ describe("ClaudeAdapterV2 background wake turns", () => {
           assert.isTrue(Exit.isSuccess(steered));
           assert.equal(harness.offeredMessages.length, offered + 1);
           assert.equal(harness.offeredMessages.at(-1)?.priority, "now");
+          if (backgrounding === "never answers") {
+            // Later steers wait on the move still in flight instead of
+            // piling up another request for the same run.
+            for (let repeat = 1; repeat <= 2; repeat++) {
+              const again = yield* Effect.forkScoped(steer);
+              // The steer's 5 second wait starts once it reaches it; move the
+              // clock until the steer has gone out.
+              for (let tick = 0; tick < 100 && again.pollUnsafe() === undefined; tick++) {
+                yield* TestClock.adjust("1 second");
+                yield* Effect.yieldNow;
+              }
+              assert.isTrue(Exit.isSuccess(yield* Fiber.await(again)));
+              assert.equal(harness.offeredMessages.length, offered + 1 + repeat);
+            }
+            assert.deepEqual(calls, [FOREGROUND_TOOL_USE_ID]);
+          }
           if (backgrounding === "answers after the steer went out") {
             yield* TestClock.adjust("1 second");
           } else if (

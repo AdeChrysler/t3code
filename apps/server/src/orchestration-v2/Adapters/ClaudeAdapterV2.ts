@@ -3498,6 +3498,10 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
         // the turn that launched the subagent (wake drain, later turns) resolve
         // their subagent through this index into sessionSubagentsByTaskId.
         const sessionSubagentTaskIdsByToolUseId = yield* Ref.make(new Map<string, string>());
+        // Requests that move a running subagent to the background before a
+        // steer, by the tool call that started its run. Claude may never
+        // answer one, so a later steer waits on it rather than asking again.
+        const backgroundMovesByToolUseId = new Map<string, Fiber.Fiber<void>>();
         // A subagent's tool calls can outlive the turn that started them, so
         // they live here rather than on a turn context: a turn that ends while
         // one runs neither fails it nor hides it from the turn that follows.
@@ -8870,9 +8874,19 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
           // Backgrounding is refused when the session disables background
           // tasks, and the SDK puts no deadline on the request. Either way the
           // steer still goes through, as it did before. A move answered after
-          // the steer stopped waiting for it still marks the subagent.
-          const moves = yield* Effect.forEach(foreground, ({ taskId, toolUseId }) =>
-            live.query.backgroundTasks(toolUseId).pipe(
+          // the steer stopped waiting for it still marks the subagent, and a
+          // later steer waits on that same move instead of asking again.
+          for (const [toolUseId, move] of backgroundMovesByToolUseId) {
+            if (move.pollUnsafe() !== undefined) backgroundMovesByToolUseId.delete(toolUseId);
+          }
+          const moves: Array<Fiber.Fiber<void>> = [];
+          for (const { taskId, toolUseId } of foreground) {
+            const inFlight = backgroundMovesByToolUseId.get(toolUseId);
+            if (inFlight !== undefined) {
+              moves.push(inFlight);
+              continue;
+            }
+            const move = yield* live.query.backgroundTasks(toolUseId).pipe(
               // Now a background subagent: its end wakes the root like one
               // Claude started in the background. One that already ended
               // while the move was answered has nothing left to report.
@@ -8899,8 +8913,10 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                 }),
               ),
               Effect.forkIn(sessionScope),
-            ),
-          );
+            );
+            backgroundMovesByToolUseId.set(toolUseId, move);
+            moves.push(move);
+          }
           yield* Fiber.joinAll(moves).pipe(Effect.timeoutOption("5 seconds"));
         });
 
