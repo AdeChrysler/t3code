@@ -8847,28 +8847,34 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
         const backgroundForegroundSubagents = Effect.fnUntraced(function* (
           live: ClaudeLiveQueryContext,
         ) {
-          for (const subagent of (yield* Ref.get(sessionSubagentsByTaskId)).values()) {
-            const toolUseId = subagent.runToolUseId;
-            if (
-              toolUseId === null ||
-              subagent.task.status !== "running" ||
-              subagent.task.parentNodeId !== subagent.rootNodeId ||
-              live.subagentsFromEarlierProcesses.has(subagent)
-            ) {
-              continue;
-            }
-            // Backgrounding is refused when the session disables background
-            // tasks. The steer still goes through, as it did before.
-            yield* live.query.backgroundTasks(toolUseId).pipe(
-              Effect.catch((cause) =>
-                Effect.logWarning("orchestration-v2.claude-steer-background-subagent-failed", {
-                  taskId: subagent.task.nativeTaskRef?.nativeId,
-                  toolUseId,
-                  cause,
-                }),
+          const foreground = Array.from(
+            (yield* Ref.get(sessionSubagentsByTaskId)).values(),
+          ).flatMap((subagent) =>
+            subagent.runToolUseId !== null &&
+            subagent.task.status === "running" &&
+            subagent.task.parentNodeId === subagent.rootNodeId &&
+            !live.subagentsFromEarlierProcesses.has(subagent)
+              ? [{ subagent, toolUseId: subagent.runToolUseId }]
+              : [],
+          );
+          // Backgrounding is refused when the session disables background
+          // tasks, and the SDK puts no deadline on the request. Either way the
+          // steer still goes through, as it did before.
+          yield* Effect.forEach(
+            foreground,
+            ({ subagent, toolUseId }) =>
+              live.query.backgroundTasks(toolUseId).pipe(
+                Effect.timeout("5 seconds"),
+                Effect.catch((cause) =>
+                  Effect.logWarning("orchestration-v2.claude-steer-background-subagent-failed", {
+                    taskId: subagent.task.nativeTaskRef?.nativeId,
+                    toolUseId,
+                    cause,
+                  }),
+                ),
               ),
-            );
-          }
+            { concurrency: "unbounded", discard: true },
+          );
         });
 
         const steerTurn = Effect.fn("ClaudeAdapterV2.steerTurn")(

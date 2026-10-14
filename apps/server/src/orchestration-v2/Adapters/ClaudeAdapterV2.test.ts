@@ -13796,9 +13796,13 @@ describe("ClaudeAdapterV2 background wake turns", () => {
     ),
   );
 
-  it.effect.each([{ backgroundingFails: false }, { backgroundingFails: true }])(
-    "moves the root's foreground subagents to the background before a steer (fails=$backgroundingFails)",
-    ({ backgroundingFails }) =>
+  it.effect.each([
+    { backgrounding: "succeeds" },
+    { backgrounding: "fails" },
+    { backgrounding: "never answers" },
+  ] as const)(
+    "moves the root's foreground subagents to the background before a steer ($backgrounding)",
+    ({ backgrounding }) =>
       Effect.scoped(
         Effect.gen(function* () {
           const FOREGROUND_TOOL_USE_ID = "toolu-steer-foreground";
@@ -13809,14 +13813,16 @@ describe("ClaudeAdapterV2 background wake turns", () => {
             backgroundTasks: (toolUseId) =>
               Effect.sync(() => calls.push(toolUseId)).pipe(
                 Effect.andThen(
-                  backgroundingFails
+                  backgrounding === "fails"
                     ? Effect.fail(
                         new ClaudeAdapterV2.ClaudeAgentSdkQueryRunnerError({
                           method: "backgroundTasks",
                           cause: new Error("Background tasks are disabled in this session."),
                         }),
                       )
-                    : Effect.succeed(true),
+                    : backgrounding === "never answers"
+                      ? Effect.never
+                      : Effect.succeed(true),
                 ),
               ),
           });
@@ -13912,7 +13918,7 @@ describe("ClaudeAdapterV2 background wake turns", () => {
           );
 
           const offered = harness.offeredMessages.length;
-          yield* harness.runtime.steerTurn({
+          const steer = harness.runtime.steerTurn({
             threadId: harness.threadId,
             runId: input.runId,
             providerThread: harness.providerThread,
@@ -13928,10 +13934,17 @@ describe("ClaudeAdapterV2 background wake turns", () => {
               attachments: [],
             },
           });
+          const steering = yield* Effect.forkScoped(steer);
+          if (backgrounding === "never answers") {
+            yield* awaitUntil(() => calls.length === 1, "background request");
+            assert.equal(harness.offeredMessages.length, offered);
+            yield* TestClock.adjust("5 seconds");
+          }
+          yield* Fiber.join(steering);
 
           // Only the root's running subagent moves: the nested one follows its
-          // owner and the finished one has nothing left to move. A refused move
-          // still lets the steer through.
+          // owner and the finished one has nothing left to move. A refused or
+          // unanswered move still lets the steer through.
           assert.deepEqual(calls, [FOREGROUND_TOOL_USE_ID]);
           assert.equal(harness.offeredMessages.length, offered + 1);
           assert.equal(harness.offeredMessages.at(-1)?.priority, "now");
