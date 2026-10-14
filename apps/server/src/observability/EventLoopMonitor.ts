@@ -121,6 +121,7 @@ export const layerWith = (
             filePath: stallLog.filePath,
             maxBytes: stallLog.maxBytes,
             maxFiles: 1,
+            throwOnError: true,
           }),
       ).pipe(
         Effect.catch(() =>
@@ -153,7 +154,11 @@ export const layerWith = (
           const time = DateTime.formatIso(yield* DateTime.now);
           yield* encodeStallLine({ time, ...attributes }).pipe(
             Effect.flatMap((line) => Effect.try(() => stallSink.write(`${line}\n`))),
-            Effect.ignore,
+            Effect.catch(() =>
+              Effect.logWarning("event loop stall log write failed", {
+                filePath: stallLog.filePath,
+              }),
+            ),
           );
         }
       });

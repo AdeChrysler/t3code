@@ -3,6 +3,7 @@ import { assert, describe, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
+import * as Logger from "effect/Logger";
 import * as Tracer from "effect/Tracer";
 import * as TestClock from "effect/testing/TestClock";
 
@@ -113,6 +114,30 @@ describe("EventLoopMonitor", () => {
       assert.isFalse(yield* fs.exists(`${filePath}.2`));
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
   );
+
+  it.effect("warns when a stall cannot be written to the stall log", () => {
+    const warnings: Array<unknown> = [];
+    const logger = Logger.make(({ message }) => {
+      warnings.push(Array.isArray(message) ? message[0] : message);
+    });
+    return Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      // A directory at the log path opens, but every append to it fails. The cap
+      // is large so the sink never rotates the directory out of the way.
+      const filePath = yield* fs.makeTempDirectoryScoped({ prefix: "t3-event-loop-" });
+      yield* monitor([stalled, stalled], { filePath, maxBytes: 1024 * 1024 });
+      yield* TestClock.adjust("60 seconds");
+      assert.deepStrictEqual(warnings, [
+        "event loop stalled for 4950 ms",
+        "event loop stall log write failed",
+      ]);
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(
+        Layer.merge(NodeServices.layer, Logger.layer([logger], { mergeWithExisting: false })),
+      ),
+    );
+  });
 
   it("ignores delay the loop spent idle, such as a system sleep", () => {
     // Waking from sleep reads as a long gap, but the loop was idle in poll for it.
