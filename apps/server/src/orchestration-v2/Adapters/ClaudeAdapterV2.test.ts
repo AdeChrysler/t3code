@@ -1254,7 +1254,7 @@ describe("ClaudeAdapterV2 Claude policy bypass downgrade", () => {
           );
 
           let openedOptions: ClaudeAdapterV2.ClaudeAgentSdkQueryOptions | undefined;
-          const adapter = ClaudeAdapterV2.makeClaudeAdapterV2({
+          const adapter = yield* ClaudeAdapterV2.makeClaudeAdapterV2({
             instanceId: ClaudeAdapterV2.CLAUDE_DEFAULT_INSTANCE_ID,
             settings: DEFAULT_CLAUDE_SETTINGS,
             environment: {},
@@ -1273,6 +1273,7 @@ describe("ClaudeAdapterV2 Claude policy bypass downgrade", () => {
                     offer: () => Effect.void,
                     setModel: () => Effect.void,
                     setPermissionMode: () => Effect.void,
+                    stopTask: () => Effect.void,
                     interrupt: Effect.void,
                     close: Effect.void,
                   };
@@ -1360,7 +1361,11 @@ describe("ClaudeAdapterV2 Claude policy bypass downgrade", () => {
 
           const notice = yield* Fiber.join(noticeEvent);
           assert.isTrue(Option.isSome(notice), "expected a one-time system_notice turn item");
-        }).pipe(Effect.provide(Layer.merge(IdAllocator.layer, NodeServices.layer))),
+        }).pipe(
+          Effect.provide(
+            Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+          ),
+        ),
       ),
   );
 
@@ -1387,7 +1392,7 @@ describe("ClaudeAdapterV2 Claude policy bypass downgrade", () => {
 
         let openedOptions: ClaudeAdapterV2.ClaudeAgentSdkQueryOptions | undefined;
         let currentQueue: Queue.Queue<SDKMessage> | undefined;
-        const adapter = ClaudeAdapterV2.makeClaudeAdapterV2({
+        const adapter = yield* ClaudeAdapterV2.makeClaudeAdapterV2({
           instanceId: ClaudeAdapterV2.CLAUDE_DEFAULT_INSTANCE_ID,
           settings: DEFAULT_CLAUDE_SETTINGS,
           environment: {},
@@ -1408,6 +1413,7 @@ describe("ClaudeAdapterV2 Claude policy bypass downgrade", () => {
                   offer: () => Effect.void,
                   setModel: () => Effect.void,
                   setPermissionMode: () => Effect.void,
+                  stopTask: () => Effect.void,
                   interrupt: Effect.void,
                   close: Queue.shutdown(queue),
                 };
@@ -1490,7 +1496,11 @@ describe("ClaudeAdapterV2 Claude policy bypass downgrade", () => {
         // The new cwd has no restricting policy: the cache must not keep the
         // first cwd's downgrade.
         assert.equal(openedOptions?.permissionMode, "bypassPermissions");
-      }).pipe(Effect.provide(Layer.merge(IdAllocator.layer, NodeServices.layer))),
+      }).pipe(
+        Effect.provide(
+          Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+        ),
+      ),
     ),
   );
 
@@ -1522,7 +1532,7 @@ describe("ClaudeAdapterV2 Claude policy bypass downgrade", () => {
 
           let openedOptions: ClaudeAdapterV2.ClaudeAgentSdkQueryOptions | undefined;
           let currentQueue: Queue.Queue<SDKMessage> | undefined;
-          const adapter = ClaudeAdapterV2.makeClaudeAdapterV2({
+          const adapter = yield* ClaudeAdapterV2.makeClaudeAdapterV2({
             instanceId: ClaudeAdapterV2.CLAUDE_DEFAULT_INSTANCE_ID,
             settings: DEFAULT_CLAUDE_SETTINGS,
             environment: {},
@@ -1543,6 +1553,7 @@ describe("ClaudeAdapterV2 Claude policy bypass downgrade", () => {
                     offer: () => Effect.void,
                     setModel: () => Effect.void,
                     setPermissionMode: () => Effect.void,
+                    stopTask: () => Effect.void,
                     interrupt: Effect.void,
                     close: Queue.shutdown(queue),
                   };
@@ -1554,7 +1565,7 @@ describe("ClaudeAdapterV2 Claude policy bypass downgrade", () => {
           });
 
           const threadId = ThreadId.make("thread-claude-bypass-policy-notice-once");
-          const runtimePolicyFullAccess = ProviderAdapterV2RuntimePolicy.make({
+          const runtimePolicyFullAccess = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
             runtimeMode: "full-access",
             interactionMode: "default",
             cwd,
@@ -1577,7 +1588,7 @@ describe("ClaudeAdapterV2 Claude policy bypass downgrade", () => {
           // One persistent collector for the whole test, polled afterward,
           // rather than several concurrent one-shot listeners on the same
           // events stream racing each other for the same items.
-          const events: Array<ProviderAdapterV2Event> = [];
+          const events: Array<ProviderAdapter.ProviderAdapterV2Event> = [];
           yield* runtime.events.pipe(
             Stream.runForEach((event) => Effect.sync(() => events.push(event))),
             Effect.forkScoped,
@@ -1616,11 +1627,13 @@ describe("ClaudeAdapterV2 Claude policy bypass downgrade", () => {
           yield* awaitUntil(() => terminalCount() === 1, "first turn terminal");
           assert.equal(noticeCount(), 1, "expected exactly one notice after the full-access turn");
 
-          const runtimePolicyApprovalRequired = ProviderAdapterV2RuntimePolicy.make({
-            runtimeMode: "approval-required",
-            interactionMode: "default",
-            cwd,
-          });
+          const runtimePolicyApprovalRequired = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make(
+            {
+              runtimeMode: "approval-required",
+              interactionMode: "default",
+              cwd,
+            },
+          );
           yield* runtime.startTurn(
             makeClaudeTestTurnInput({
               threadId,
@@ -1663,7 +1676,11 @@ describe("ClaudeAdapterV2 Claude policy bypass downgrade", () => {
             1,
             "the approval-required turn must not announce a downgrade of its own",
           );
-        }).pipe(Effect.provide(Layer.merge(IdAllocator.layer, NodeServices.layer))),
+        }).pipe(
+          Effect.provide(
+            Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+          ),
+        ),
       ),
   );
 
@@ -1694,7 +1711,7 @@ describe("ClaudeAdapterV2 Claude policy bypass downgrade", () => {
         let openedOptions: ClaudeAdapterV2.ClaudeAgentSdkQueryOptions | undefined;
         let currentQueue: Queue.Queue<SDKMessage> | undefined;
         let nextNativeThreadId = 0;
-        const adapter = ClaudeAdapterV2.makeClaudeAdapterV2({
+        const adapter = yield* ClaudeAdapterV2.makeClaudeAdapterV2({
           instanceId: ClaudeAdapterV2.CLAUDE_DEFAULT_INSTANCE_ID,
           settings: DEFAULT_CLAUDE_SETTINGS,
           environment: {},
@@ -1719,6 +1736,7 @@ describe("ClaudeAdapterV2 Claude policy bypass downgrade", () => {
                   offer: () => Effect.void,
                   setModel: () => Effect.void,
                   setPermissionMode: () => Effect.void,
+                  stopTask: () => Effect.void,
                   interrupt: Effect.void,
                   close: Queue.shutdown(queue),
                 };
@@ -1731,12 +1749,12 @@ describe("ClaudeAdapterV2 Claude policy bypass downgrade", () => {
 
         const threadA = ThreadId.make("thread-claude-bypass-policy-sibling-a");
         const threadB = ThreadId.make("thread-claude-bypass-policy-sibling-b");
-        const runtimePolicyFullAccess = ProviderAdapterV2RuntimePolicy.make({
+        const runtimePolicyFullAccess = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
           runtimeMode: "full-access",
           interactionMode: "default",
           cwd,
         });
-        const runtimePolicyApprovalRequired = ProviderAdapterV2RuntimePolicy.make({
+        const runtimePolicyApprovalRequired = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
           runtimeMode: "approval-required",
           interactionMode: "default",
           cwd,
@@ -1761,7 +1779,7 @@ describe("ClaudeAdapterV2 Claude policy bypass downgrade", () => {
         });
         const now = yield* DateTime.now;
 
-        const events: Array<ProviderAdapterV2Event> = [];
+        const events: Array<ProviderAdapter.ProviderAdapterV2Event> = [];
         yield* runtime.events.pipe(
           Stream.runForEach((event) => Effect.sync(() => events.push(event))),
           Effect.forkScoped,
@@ -1836,7 +1854,11 @@ describe("ClaudeAdapterV2 Claude policy bypass downgrade", () => {
           1,
           "thread B's approval-required turn must not announce a downgrade for itself",
         );
-      }).pipe(Effect.provide(Layer.merge(IdAllocator.layer, NodeServices.layer))),
+      }).pipe(
+        Effect.provide(
+          Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+        ),
+      ),
     ),
   );
 
@@ -1866,7 +1888,7 @@ describe("ClaudeAdapterV2 Claude policy bypass downgrade", () => {
           );
 
           let openedOptions: ClaudeAdapterV2.ClaudeAgentSdkQueryOptions | undefined;
-          const adapter = ClaudeAdapterV2.makeClaudeAdapterV2({
+          const adapter = yield* ClaudeAdapterV2.makeClaudeAdapterV2({
             instanceId: ClaudeAdapterV2.CLAUDE_DEFAULT_INSTANCE_ID,
             // No configured homePath: this is the default instance, even
             // though the environment below carries an inherited
@@ -1888,6 +1910,7 @@ describe("ClaudeAdapterV2 Claude policy bypass downgrade", () => {
                     offer: () => Effect.void,
                     setModel: () => Effect.void,
                     setPermissionMode: () => Effect.void,
+                    stopTask: () => Effect.void,
                     interrupt: Effect.void,
                     close: Effect.void,
                   };
@@ -1932,7 +1955,11 @@ describe("ClaudeAdapterV2 Claude policy bypass downgrade", () => {
           );
 
           assert.equal(openedOptions?.permissionMode, "auto");
-        }).pipe(Effect.provide(Layer.merge(IdAllocator.layer, NodeServices.layer))),
+        }).pipe(
+          Effect.provide(
+            Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+          ),
+        ),
       ),
   );
 
@@ -1966,7 +1993,7 @@ describe("ClaudeAdapterV2 Claude policy bypass downgrade", () => {
           });
 
           let openedOptions: ClaudeAdapterV2.ClaudeAgentSdkQueryOptions | undefined;
-          const adapter = ClaudeAdapterV2.makeClaudeAdapterV2({
+          const adapter = yield* ClaudeAdapterV2.makeClaudeAdapterV2({
             instanceId: ClaudeAdapterV2.CLAUDE_DEFAULT_INSTANCE_ID,
             settings: { ...DEFAULT_CLAUDE_SETTINGS, homePath: customHome },
             environment: {},
@@ -1985,6 +2012,7 @@ describe("ClaudeAdapterV2 Claude policy bypass downgrade", () => {
                     offer: () => Effect.void,
                     setModel: () => Effect.void,
                     setPermissionMode: () => Effect.void,
+                    stopTask: () => Effect.void,
                     interrupt: Effect.void,
                     close: Effect.void,
                   };
@@ -1995,7 +2023,7 @@ describe("ClaudeAdapterV2 Claude policy bypass downgrade", () => {
             },
           });
 
-          const runtimePolicy = ProviderAdapterV2RuntimePolicy.make({
+          const runtimePolicy = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
             runtimeMode: "full-access",
             interactionMode: "default",
             cwd,
@@ -2029,7 +2057,11 @@ describe("ClaudeAdapterV2 Claude policy bypass downgrade", () => {
           );
 
           assert.equal(openedOptions?.permissionMode, "auto");
-        }).pipe(Effect.provide(Layer.merge(IdAllocator.layer, NodeServices.layer))),
+        }).pipe(
+          Effect.provide(
+            Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+          ),
+        ),
       ),
   );
 
@@ -2055,7 +2087,7 @@ describe("ClaudeAdapterV2 Claude policy bypass downgrade", () => {
           });
 
           let openedOptions: ClaudeAdapterV2.ClaudeAgentSdkQueryOptions | undefined;
-          const adapter = ClaudeAdapterV2.makeClaudeAdapterV2({
+          const adapter = yield* ClaudeAdapterV2.makeClaudeAdapterV2({
             instanceId: ClaudeAdapterV2.CLAUDE_DEFAULT_INSTANCE_ID,
             settings: { ...DEFAULT_CLAUDE_SETTINGS, homePath: customHome },
             environment: {},
@@ -2076,6 +2108,7 @@ describe("ClaudeAdapterV2 Claude policy bypass downgrade", () => {
                     offer: () => Effect.void,
                     setModel: () => Effect.void,
                     setPermissionMode: () => Effect.void,
+                    stopTask: () => Effect.void,
                     interrupt: Effect.void,
                     close: Effect.void,
                   };
@@ -2086,7 +2119,7 @@ describe("ClaudeAdapterV2 Claude policy bypass downgrade", () => {
             },
           });
 
-          const runtimePolicy = ProviderAdapterV2RuntimePolicy.make({
+          const runtimePolicy = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
             runtimeMode: "full-access",
             interactionMode: "default",
             cwd,
@@ -2120,7 +2153,11 @@ describe("ClaudeAdapterV2 Claude policy bypass downgrade", () => {
           );
 
           assert.equal(openedOptions?.permissionMode, "auto");
-        }).pipe(Effect.provide(Layer.merge(IdAllocator.layer, NodeServices.layer))),
+        }).pipe(
+          Effect.provide(
+            Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+          ),
+        ),
       ),
   );
 
@@ -2144,7 +2181,7 @@ describe("ClaudeAdapterV2 Claude policy bypass downgrade", () => {
           });
 
           let openedOptions: ClaudeAdapterV2.ClaudeAgentSdkQueryOptions | undefined;
-          const adapter = ClaudeAdapterV2.makeClaudeAdapterV2({
+          const adapter = yield* ClaudeAdapterV2.makeClaudeAdapterV2({
             instanceId: ClaudeAdapterV2.CLAUDE_DEFAULT_INSTANCE_ID,
             settings: { ...DEFAULT_CLAUDE_SETTINGS, homePath: customHome },
             environment: {},
@@ -2163,6 +2200,7 @@ describe("ClaudeAdapterV2 Claude policy bypass downgrade", () => {
                     offer: () => Effect.void,
                     setModel: () => Effect.void,
                     setPermissionMode: () => Effect.void,
+                    stopTask: () => Effect.void,
                     interrupt: Effect.void,
                     close: Effect.void,
                   };
@@ -2173,7 +2211,7 @@ describe("ClaudeAdapterV2 Claude policy bypass downgrade", () => {
             },
           });
 
-          const runtimePolicy = ProviderAdapterV2RuntimePolicy.make({
+          const runtimePolicy = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
             runtimeMode: "full-access",
             interactionMode: "default",
             cwd,
@@ -2207,7 +2245,11 @@ describe("ClaudeAdapterV2 Claude policy bypass downgrade", () => {
           );
 
           assert.equal(openedOptions?.permissionMode, "bypassPermissions");
-        }).pipe(Effect.provide(Layer.merge(IdAllocator.layer, NodeServices.layer))),
+        }).pipe(
+          Effect.provide(
+            Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+          ),
+        ),
       ),
   );
 });
@@ -3506,7 +3548,7 @@ describe("ClaudeAdapterV2 background wake turns", () => {
                     }),
                   setModel: () => Effect.void,
                   setPermissionMode: () => Effect.void,
-                  stopTask: options?.stopTask ?? (() => Effect.void),
+                  stopTask: () => Effect.void,
                   interrupt: Effect.void,
                   close: Queue.shutdown(processMessages),
                 };
