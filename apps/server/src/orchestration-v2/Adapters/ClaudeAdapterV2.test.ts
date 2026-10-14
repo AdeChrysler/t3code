@@ -14184,7 +14184,12 @@ describe("ClaudeAdapterV2 background wake turns", () => {
           status: "complete",
           checks: 0,
         });
-      }).pipe(Effect.scoped, Effect.provide(Layer.merge(IdAllocator.layer, NodeServices.layer))),
+      }).pipe(
+        Effect.scoped,
+        Effect.provide(
+          Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+        ),
+      ),
     );
 
     // Claude's goal check waits on agents, workflows and shells by task type,
@@ -14231,7 +14236,12 @@ describe("ClaudeAdapterV2 background wake turns", () => {
         }
         yield* Queue.take(harness.terminalReceipts);
         assert.equal(goalStatuses(harness.events).at(-1)?.status, input.status);
-      }).pipe(Effect.scoped, Effect.provide(Layer.merge(IdAllocator.layer, NodeServices.layer))),
+      }).pipe(
+        Effect.scoped,
+        Effect.provide(
+          Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+        ),
+      ),
     );
 
     it.effect("keeps a goal active after a command turn with no model output", () =>
