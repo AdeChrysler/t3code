@@ -14723,6 +14723,36 @@ describe("ClaudeAdapterV2 background wake turns", () => {
       }).pipe(Effect.scoped, Effect.provide(goalTestLayer)),
     );
 
+    // Claude Code checks the evaluator's answer with `reason` optional, and an
+    // answer without one writes an unmet record without `reason`. It is still a
+    // check that found the record's goal unmet.
+    it.effect.each([
+      { shown: "a different objective", objective: "the old objective" },
+      { shown: "the same objective, complete", objective: "the docs build" },
+    ])("pursues the record's goal after an unmet check without a reason over $shown", (input) =>
+      Effect.gen(function* () {
+        const harness = yield* makeWakeHarness;
+        const condition = "the docs build";
+        yield* startGoalTurn(harness, {
+          attempt: "goal-mirror-no-reason",
+          text: "Keep going.",
+          goal: { objective: input.objective, status: "complete", checks: 1, lastCheck: "Old." },
+        });
+        yield* offerAll(harness, [
+          goalRecords([]),
+          makeAssistantTextFrame({ uuid: "goal-mirror-no-reason-work", text: "Building." }),
+          goalRecords([{ type: "goal_status", met: false, condition }]),
+          makeResultFrame({ uuid: "goal-mirror-no-reason-result", result: "Building." }),
+        ]);
+        yield* Queue.take(harness.terminalReceipts);
+        assert.deepEqual(goalStatuses(harness.events).at(-1), {
+          objective: condition,
+          status: "active",
+          checks: input.objective === condition ? 2 : 1,
+        });
+      }).pipe(Effect.scoped, Effect.provide(goalTestLayer)),
+    );
+
     it.effect("resets on a new goal and drops a goal Claude clears", () =>
       Effect.gen(function* () {
         const harness = yield* makeWakeHarness;

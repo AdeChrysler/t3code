@@ -1487,8 +1487,14 @@ function nextClaudeGoalFromRecord(
   if (record.failed === true) return null;
   const checks = current?.objective === objective ? (current.checks ?? 0) : 0;
   if (record.met) return { objective, status: "complete", checks };
-  if (record.reason === undefined) return current;
-  return { objective, status: "active", checks: checks + 1, lastCheck: record.reason.trim() };
+  // An unmet check. Claude accepts an evaluator answer without a reason, and
+  // then the record has none.
+  return {
+    objective,
+    status: "active",
+    checks: checks + 1,
+    ...(record.reason === undefined ? {} : { lastCheck: record.reason.trim() }),
+  };
 }
 
 const providerGoalsEqual = Schema.toEquivalence(Schema.NullOr(OrchestrationV2ProviderGoal));
