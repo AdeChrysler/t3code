@@ -13800,6 +13800,7 @@ describe("ClaudeAdapterV2 background wake turns", () => {
     { backgrounding: "succeeds" },
     { backgrounding: "fails" },
     { backgrounding: "never answers" },
+    { backgrounding: "answers after the steer went out" },
     { backgrounding: "answers after the turn ended" },
     { backgrounding: "answers after the subagent ran again" },
   ] as const)(
@@ -13829,7 +13830,9 @@ describe("ClaudeAdapterV2 background wake turns", () => {
                         )
                       : backgrounding === "never answers"
                         ? Effect.never
-                        : Effect.succeed(true),
+                        : backgrounding === "answers after the steer went out"
+                          ? Effect.sleep("6 seconds").pipe(Effect.as(true))
+                          : Effect.succeed(true),
                 ),
               ),
           });
@@ -13984,7 +13987,10 @@ describe("ClaudeAdapterV2 background wake turns", () => {
               );
           }
           const steering = yield* Effect.forkScoped(steer);
-          if (backgrounding === "never answers") {
+          if (
+            backgrounding === "never answers" ||
+            backgrounding === "answers after the steer went out"
+          ) {
             yield* awaitUntil(() => calls.length === 1, "background request");
             assert.equal(harness.offeredMessages.length, offered);
             yield* TestClock.adjust("5 seconds");
@@ -14004,7 +14010,9 @@ describe("ClaudeAdapterV2 background wake turns", () => {
           assert.isTrue(Exit.isSuccess(steered));
           assert.equal(harness.offeredMessages.length, offered + 1);
           assert.equal(harness.offeredMessages.at(-1)?.priority, "now");
-          if (
+          if (backgrounding === "answers after the steer went out") {
+            yield* TestClock.adjust("1 second");
+          } else if (
             backgrounding !== "succeeds" &&
             backgrounding !== "answers after the subagent ran again"
           ) {

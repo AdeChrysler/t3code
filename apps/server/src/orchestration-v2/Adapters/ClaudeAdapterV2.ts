@@ -91,6 +91,7 @@ import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Equal from "effect/Equal";
 import * as Exit from "effect/Exit";
+import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
@@ -8868,40 +8869,39 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
           }
           // Backgrounding is refused when the session disables background
           // tasks, and the SDK puts no deadline on the request. Either way the
-          // steer still goes through, as it did before.
-          yield* Effect.forEach(
-            foreground,
-            ({ taskId, toolUseId }) =>
-              live.query.backgroundTasks(toolUseId).pipe(
-                Effect.timeout("5 seconds"),
-                // Now a background subagent: its end wakes the root like one
-                // Claude started in the background. One that already ended
-                // while the move was answered has nothing left to report.
-                Effect.flatMap((moved) =>
-                  moved
-                    ? Ref.get(sessionSubagentsByTaskId).pipe(
-                        Effect.flatMap((registry) =>
-                          registry.get(taskId)?.task.status === "running" &&
-                          // Not a later run of it that started meanwhile.
-                          registry.get(taskId)?.runToolUseId === toolUseId
-                            ? Ref.update(backgroundedSubagentTaskIds, (current) =>
-                                new Set(current).add(taskId),
-                              )
-                            : Effect.void,
-                        ),
-                      )
-                    : Effect.void,
-                ),
-                Effect.catch((cause) =>
-                  Effect.logWarning("orchestration-v2.claude-steer-background-subagent-failed", {
-                    taskId,
-                    toolUseId,
-                    cause,
-                  }),
-                ),
+          // steer still goes through, as it did before. A move answered after
+          // the steer stopped waiting for it still marks the subagent.
+          const moves = yield* Effect.forEach(foreground, ({ taskId, toolUseId }) =>
+            live.query.backgroundTasks(toolUseId).pipe(
+              // Now a background subagent: its end wakes the root like one
+              // Claude started in the background. One that already ended
+              // while the move was answered has nothing left to report.
+              Effect.flatMap((moved) =>
+                moved
+                  ? Ref.get(sessionSubagentsByTaskId).pipe(
+                      Effect.flatMap((registry) =>
+                        registry.get(taskId)?.task.status === "running" &&
+                        // Not a later run of it that started meanwhile.
+                        registry.get(taskId)?.runToolUseId === toolUseId
+                          ? Ref.update(backgroundedSubagentTaskIds, (current) =>
+                              new Set(current).add(taskId),
+                            )
+                          : Effect.void,
+                      ),
+                    )
+                  : Effect.void,
               ),
-            { concurrency: "unbounded", discard: true },
+              Effect.catch((cause) =>
+                Effect.logWarning("orchestration-v2.claude-steer-background-subagent-failed", {
+                  taskId,
+                  toolUseId,
+                  cause,
+                }),
+              ),
+              Effect.forkIn(sessionScope),
+            ),
           );
+          yield* Fiber.joinAll(moves).pipe(Effect.timeoutOption("5 seconds"));
         });
 
         const steerTurn = Effect.fn("ClaudeAdapterV2.steerTurn")(
