@@ -382,6 +382,10 @@ export interface ClaudeAgentSdkQuerySession {
     mode: PermissionMode,
   ) => Effect.Effect<void, ClaudeAgentSdkQueryRunnerError>;
   readonly stopTask: (taskId: string) => Effect.Effect<void, ClaudeAgentSdkQueryRunnerError>;
+  /** Moves the foreground task one tool call started to the background; false when none matched. */
+  readonly backgroundTasks: (
+    toolUseId: string,
+  ) => Effect.Effect<boolean, ClaudeAgentSdkQueryRunnerError>;
   readonly interrupt: Effect.Effect<void, ClaudeAgentSdkQueryRunnerError>;
   readonly close: Effect.Effect<void, ClaudeAgentSdkQueryRunnerError>;
 }
@@ -535,6 +539,14 @@ export type ClaudeAgentSdkProtocolLogEvent =
       readonly payload: {
         readonly type: "query.stop_task";
         readonly taskId: string;
+      };
+    }
+  | {
+      readonly direction: "outgoing";
+      readonly stage: "decoded";
+      readonly payload: {
+        readonly type: "query.background_tasks";
+        readonly toolUseId: string;
       };
     }
   | {
@@ -839,6 +851,19 @@ export const layerQueryRunner: Layer.Layer<
                   direction: "outgoing",
                   stage: "decoded",
                   payload: { type: "query.stop_task", taskId },
+                }),
+              ),
+            ),
+          backgroundTasks: (toolUseId) =>
+            Effect.tryPromise({
+              try: () => queryRuntime.backgroundTasks(toolUseId),
+              catch: (cause) => queryRunnerError(cause, "backgroundTasks"),
+            }).pipe(
+              Effect.tap(() =>
+                logProtocolEvent({
+                  direction: "outgoing",
+                  stage: "decoded",
+                  payload: { type: "query.background_tasks", toolUseId },
                 }),
               ),
             ),
@@ -8814,6 +8839,38 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             ),
         );
 
+        // A steer is sent with priority "now", which cancels the root turn's
+        // running tool calls. A subagent the root launched in the foreground is
+        // one of them, so it moves to the background first and keeps running;
+        // its result arrives as a task notification like any background agent.
+        // Subagents a subagent launched stay put: they follow their owner.
+        const backgroundForegroundSubagents = Effect.fnUntraced(function* (
+          live: ClaudeLiveQueryContext,
+        ) {
+          for (const subagent of (yield* Ref.get(sessionSubagentsByTaskId)).values()) {
+            const toolUseId = subagent.runToolUseId;
+            if (
+              toolUseId === null ||
+              subagent.task.status !== "running" ||
+              subagent.task.parentNodeId !== subagent.rootNodeId ||
+              live.subagentsFromEarlierProcesses.has(subagent)
+            ) {
+              continue;
+            }
+            // Backgrounding is refused when the session disables background
+            // tasks. The steer still goes through, as it did before.
+            yield* live.query.backgroundTasks(toolUseId).pipe(
+              Effect.catch((cause) =>
+                Effect.logWarning("orchestration-v2.claude-steer-background-subagent-failed", {
+                  taskId: subagent.task.nativeTaskRef?.nativeId,
+                  toolUseId,
+                  cause,
+                }),
+              ),
+            );
+          }
+        });
+
         const steerTurn = Effect.fn("ClaudeAdapterV2.steerTurn")(
           function* (turnInput: ProviderAdapter.ProviderAdapterV2SteerInput) {
             const existing = yield* Ref.get(queryContext);
@@ -8846,6 +8903,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
               next.add(turnInput.providerTurnId);
               return next;
             });
+            yield* backgroundForegroundSubagents(existing);
             yield* existing.query.offer(userMessage);
           },
           (effect, turnInput) =>
