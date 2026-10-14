@@ -13801,6 +13801,7 @@ describe("ClaudeAdapterV2 background wake turns", () => {
     { backgrounding: "fails" },
     { backgrounding: "never answers" },
     { backgrounding: "answers after the turn ended" },
+    { backgrounding: "answers after the subagent ran again" },
   ] as const)(
     "moves the root's foreground subagents to the background before a steer ($backgrounding)",
     ({ backgrounding }) =>
@@ -13810,14 +13811,15 @@ describe("ClaudeAdapterV2 background wake turns", () => {
           const NESTED_TOOL_USE_ID = "toolu-steer-nested";
           const FINISHED_TOOL_USE_ID = "toolu-steer-finished";
           const calls: Array<string> = [];
-          // The root turn settles while the move is still unanswered.
-          let endTurnFirst: Effect.Effect<void> = Effect.void;
+          // What happens while the move is still unanswered.
+          let beforeAnswer: Effect.Effect<void> = Effect.void;
           const harness = yield* makeWakeHarnessWithOptions({
             backgroundTasks: (toolUseId) =>
               Effect.sync(() => calls.push(toolUseId)).pipe(
                 Effect.andThen(
-                  backgrounding === "answers after the turn ended"
-                    ? Effect.suspend(() => endTurnFirst).pipe(Effect.as(true))
+                  backgrounding === "answers after the turn ended" ||
+                    backgrounding === "answers after the subagent ran again"
+                    ? Effect.suspend(() => beforeAnswer).pipe(Effect.as(true))
                     : backgrounding === "fails"
                       ? Effect.fail(
                           new ClaudeAdapterV2.ClaudeAgentSdkQueryRunnerError({
@@ -13842,12 +13844,14 @@ describe("ClaudeAdapterV2 background wake turns", () => {
             attachments: [],
           });
           yield* harness.runtime.startTurn(input);
-          endTurnFirst = Queue.offer(
-            harness.sdkMessages,
-            makeResultFrame({ uuid: "00000000-0000-4000-8000-000000000a10", result: "Done." }),
-          ).pipe(
-            Effect.andThen(awaitUntil(() => harness.terminalEvents().length === 1, "turn end")),
-          );
+          if (backgrounding === "answers after the turn ended") {
+            beforeAnswer = Queue.offer(
+              harness.sdkMessages,
+              makeResultFrame({ uuid: "00000000-0000-4000-8000-000000000a10", result: "Done." }),
+            ).pipe(
+              Effect.andThen(awaitUntil(() => harness.terminalEvents().length === 1, "turn end")),
+            );
+          }
           const foregroundTaskStarted = (task: {
             readonly spawnDepth?: number;
             readonly taskId: string;
@@ -13955,6 +13959,30 @@ describe("ClaudeAdapterV2 background wake turns", () => {
               attachments: [],
             },
           });
+          const RERUN_TOOL_USE_ID = "toolu-steer-rerun";
+          if (backgrounding === "answers after the subagent ran again") {
+            // It ends and a SendMessage runs it again, in the foreground.
+            beforeAnswer = harness
+              .offerAndWait(
+                makeSubagentNotificationFrame({
+                  taskId: "task-steer-foreground",
+                  toolUseId: FOREGROUND_TOOL_USE_ID,
+                  summary: "First run done.",
+                  uuid: "00000000-0000-4000-8000-000000000a12",
+                }),
+              )
+              .pipe(
+                Effect.andThen(
+                  harness.offerAndWait(
+                    foregroundTaskStarted({
+                      taskId: "task-steer-foreground",
+                      toolUseId: RERUN_TOOL_USE_ID,
+                      uuid: "00000000-0000-4000-8000-000000000a13",
+                    }),
+                  ),
+                ),
+              );
+          }
           const steering = yield* Effect.forkScoped(steer);
           if (backgrounding === "never answers") {
             yield* awaitUntil(() => calls.length === 1, "background request");
@@ -13976,7 +14004,15 @@ describe("ClaudeAdapterV2 background wake turns", () => {
           assert.isTrue(Exit.isSuccess(steered));
           assert.equal(harness.offeredMessages.length, offered + 1);
           assert.equal(harness.offeredMessages.at(-1)?.priority, "now");
-          if (backgrounding !== "succeeds") return;
+          if (
+            backgrounding !== "succeeds" &&
+            backgrounding !== "answers after the subagent ran again"
+          ) {
+            return;
+          }
+          // The move answered for the first run; the second runs in the
+          // foreground, so its end is the parent's tool result, not a wake.
+          const reran = backgrounding === "answers after the subagent ran again";
 
           // The moved subagent outlives the steered turn. When it ends during
           // the user's next turn, Claude's wake after that turn names it.
@@ -14005,7 +14041,7 @@ describe("ClaudeAdapterV2 background wake turns", () => {
           for (const frame of [
             makeSubagentNotificationFrame({
               taskId: "task-steer-foreground",
-              toolUseId: FOREGROUND_TOOL_USE_ID,
+              toolUseId: reran ? RERUN_TOOL_USE_ID : FOREGROUND_TOOL_USE_ID,
               summary: "AUDITED",
               uuid: "00000000-0000-4000-8000-000000000a08",
             }),
@@ -14018,7 +14054,7 @@ describe("ClaudeAdapterV2 background wake turns", () => {
           yield* awaitUntil(() => harness.continuationRequests.length === 1, "subagent wake");
           assert.equal(
             harness.continuationRequests[0]?.notification?.summary,
-            'Subagent "task-steer-foreground" finished',
+            reran ? undefined : 'Subagent "task-steer-foreground" finished',
           );
         }).pipe(
           Effect.provide(

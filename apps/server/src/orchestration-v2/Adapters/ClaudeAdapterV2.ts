@@ -8881,7 +8881,9 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                   moved
                     ? Ref.get(sessionSubagentsByTaskId).pipe(
                         Effect.flatMap((registry) =>
-                          registry.get(taskId)?.task.status === "running"
+                          registry.get(taskId)?.task.status === "running" &&
+                          // Not a later run of it that started meanwhile.
+                          registry.get(taskId)?.runToolUseId === toolUseId
                             ? Ref.update(backgroundedSubagentTaskIds, (current) =>
                                 new Set(current).add(taskId),
                               )
