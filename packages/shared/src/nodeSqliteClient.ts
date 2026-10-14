@@ -18,6 +18,7 @@ import { identity } from "effect/Function";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Predicate from "effect/Predicate";
+import * as References from "effect/References";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
 import * as Semaphore from "effect/Semaphore";
@@ -817,19 +818,25 @@ const make = Effect.fn("makeWithDatabase")(function* (
     start: bigint,
   ): Acquired => ({
     connection: target.name,
-    lockWaitMs: Number((clock.currentTimeNanosUnsafe() - start) / 1000n) / 1000,
+    lockWaitMs: Number((clock.monotonicTimeNanosUnsafe() - start) / 1000n) / 1000,
   });
 
   const acquirer = Effect.flatMap(route, (target) =>
     Effect.withFiber((fiber) => {
+      // The statement's span is current here only when it propagates, which
+      // Statement skips while tracing is off. Otherwise the current span is
+      // the caller's, so leave it alone.
+      if (
+        !fiber.getRef(References.TracerEnabled) ||
+        !fiber.getRef(Statement.SpanPropagationEnabled)
+      ) {
+        return target.lock.withPermits(1)(Effect.succeed(target.connection));
+      }
       const clock = fiber.getRef(Clock.Clock);
-      const start = clock.currentTimeNanosUnsafe();
+      const start = clock.monotonicTimeNanosUnsafe();
       return target.lock.withPermits(1)(
         Effect.sync(() => {
-          // The statement's span is current here only when it propagates.
-          if (fiber.getRef(Statement.SpanPropagationEnabled)) {
-            annotateAcquired(fiber, acquired(target, clock, start));
-          }
+          annotateAcquired(fiber, acquired(target, clock, start));
           return target.connection;
         }),
       );
@@ -840,7 +847,7 @@ const make = Effect.fn("makeWithDatabase")(function* (
       const fiber = Fiber.getCurrent()!;
       const scope = Context.getUnsafe(fiber.context, Scope.Scope);
       const clock = fiber.getRef(Clock.Clock);
-      const start = clock.currentTimeNanosUnsafe();
+      const start = clock.monotonicTimeNanosUnsafe();
       return Effect.as(
         Effect.tap(restore(target.lock.take(1)), () => {
           const pending = fiber.getRef(TransactionAcquire);
@@ -871,16 +878,19 @@ const make = Effect.fn("makeWithDatabase")(function* (
   });
   const withTransaction = client.withTransaction;
   return Object.assign(client, {
-    withTransaction: <A, E, R>(effect: Effect.Effect<A, E, R>) => {
-      const pending: { acquired?: Acquired } = {};
-      // The body runs with the `sql.transaction` span current. A nested
-      // transaction acquires nothing, so its span gets no attributes.
-      const body = Effect.withFiber<A, E, R>((fiber) => {
-        annotateAcquired(fiber, pending.acquired);
-        return effect;
-      });
-      return withTransaction(body).pipe(Effect.provideService(TransactionAcquire, pending));
-    },
+    // Each run gets its own holder, so a reused transaction Effect never
+    // carries an earlier run's attributes.
+    withTransaction: <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+      Effect.suspend(() => {
+        const pending: { acquired?: Acquired } = {};
+        // The body runs with the `sql.transaction` span current. A nested
+        // transaction acquires nothing, so its span gets no attributes.
+        const body = Effect.withFiber<A, E, R>((fiber) => {
+          annotateAcquired(fiber, pending.acquired);
+          return effect;
+        });
+        return withTransaction(body).pipe(Effect.provideService(TransactionAcquire, pending));
+      }),
   });
 });
 

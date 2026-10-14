@@ -464,6 +464,44 @@ it.effect("labels SQL spans with their connection and how long they waited for i
   );
 });
 
+it.effect("labels only the span of the statement or transaction that took the lock", () => {
+  const spans: Array<Tracer.NativeSpan> = [];
+  const tracer = Tracer.make({
+    span: (options) => {
+      const span = new Tracer.NativeSpan(options);
+      spans.push(span);
+      return span;
+    },
+  });
+  return Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    const transaction = sql.withTransaction(sql`SELECT 1`);
+    yield* transaction;
+    // Run again nested, the same Effect reuses the outer connection and takes no lock.
+    yield* sql.withTransaction(transaction);
+    // With tracing off, Statement does not make its span current.
+    yield* sql`SELECT 2`.pipe(Effect.withTracerEnabled(false));
+  }).pipe(
+    Effect.withSpan("caller"),
+    Effect.provide(SqliteClient.layer({ filename: ":memory:" })),
+    Effect.provideService(Statement.SpanPropagationEnabled, true),
+    Effect.withTracer(tracer),
+    Effect.map(() => {
+      assert.deepStrictEqual(
+        spans
+          .filter((span) => span.name === "caller" || span.name === "sql.transaction")
+          .map((span) => [span.name, span.attributes.get("db.connection")]),
+        [
+          ["caller", undefined],
+          ["sql.transaction", "writer"],
+          ["sql.transaction", "writer"],
+          ["sql.transaction", undefined],
+        ],
+      );
+    }),
+  );
+});
+
 it.effect("keeps large parameters off the reader worker's cached statements", () =>
   withReaderClient((sql) =>
     Effect.gen(function* () {

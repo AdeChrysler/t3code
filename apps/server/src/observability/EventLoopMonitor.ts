@@ -123,10 +123,10 @@ export const layerWith = (
             maxFiles: 1,
           }),
       ).pipe(
-        Effect.catch((error) =>
-          Effect.logWarning("event loop stall log unavailable", { error }).pipe(
-            Effect.as(undefined),
-          ),
+        Effect.catch(() =>
+          Effect.logWarning("event loop stall log unavailable", {
+            filePath: stallLog.filePath,
+          }).pipe(Effect.as(undefined)),
         ),
       );
       const tick = Effect.gen(function* () {
