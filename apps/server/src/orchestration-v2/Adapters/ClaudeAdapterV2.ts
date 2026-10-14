@@ -8865,6 +8865,16 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             ({ subagent, toolUseId }) =>
               live.query.backgroundTasks(toolUseId).pipe(
                 Effect.timeout("5 seconds"),
+                // Now a background subagent: its end wakes the root like one
+                // Claude started in the background.
+                Effect.flatMap((moved) => {
+                  const taskId = subagent.task.nativeTaskRef?.nativeId;
+                  return moved && typeof taskId === "string"
+                    ? Ref.update(backgroundedSubagentTaskIds, (current) =>
+                        new Set(current).add(taskId),
+                      )
+                    : Effect.void;
+                }),
                 Effect.catch((cause) =>
                   Effect.logWarning("orchestration-v2.claude-steer-background-subagent-failed", {
                     taskId: subagent.task.nativeTaskRef?.nativeId,

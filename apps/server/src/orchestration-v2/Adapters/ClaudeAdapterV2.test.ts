@@ -13948,6 +13948,50 @@ describe("ClaudeAdapterV2 background wake turns", () => {
           assert.deepEqual(calls, [FOREGROUND_TOOL_USE_ID]);
           assert.equal(harness.offeredMessages.length, offered + 1);
           assert.equal(harness.offeredMessages.at(-1)?.priority, "now");
+          if (backgrounding !== "succeeds") return;
+
+          // The moved subagent outlives the steered turn. When it ends during
+          // the user's next turn, Claude's wake after that turn names it.
+          for (const frame of [
+            makeResultFrame({
+              uuid: "00000000-0000-4000-8000-000000000a06",
+              result: "",
+              terminalReason: "aborted_tools",
+            }),
+            makeResultFrame({ uuid: "00000000-0000-4000-8000-000000000a07", result: "Docs too." }),
+          ]) {
+            yield* Queue.offer(harness.sdkMessages, frame);
+          }
+          yield* awaitUntil(() => harness.terminalEvents().length === 1, "steered turn terminal");
+          yield* harness.runtime.startTurn(
+            makeClaudeTestTurnInput({
+              threadId: harness.threadId,
+              providerThread: harness.providerThread,
+              now: yield* DateTime.now,
+              attemptId: RunAttemptId.make("attempt-steer-next-turn"),
+              text: "Anything else?",
+              attachments: [],
+              providerTurnOrdinal: 2,
+            }),
+          );
+          for (const frame of [
+            makeSubagentNotificationFrame({
+              taskId: "task-steer-foreground",
+              toolUseId: FOREGROUND_TOOL_USE_ID,
+              summary: "AUDITED",
+              uuid: "00000000-0000-4000-8000-000000000a08",
+            }),
+            makeResultFrame({ uuid: "00000000-0000-4000-8000-000000000a09", result: "No." }),
+          ]) {
+            yield* Queue.offer(harness.sdkMessages, frame);
+          }
+          yield* awaitUntil(() => harness.terminalEvents().length === 2, "next turn terminal");
+          yield* Queue.offer(harness.sdkMessages, wakeTurnInit);
+          yield* awaitUntil(() => harness.continuationRequests.length === 1, "subagent wake");
+          assert.equal(
+            harness.continuationRequests[0]?.notification?.summary,
+            'Subagent "task-steer-foreground" finished',
+          );
         }).pipe(
           Effect.provide(
             Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
