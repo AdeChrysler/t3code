@@ -621,11 +621,11 @@ wait_for_pid_exit() {
   done
 }
 # kill -0 also succeeds for a server that exited but was not reaped yet, so
-# a zombie, or a host without ps to tell, does not count as running.
-adopted_server_running() {
-  [ -n "$ADOPTED_PID" ] && kill -0 "$ADOPTED_PID" 2>/dev/null || return 1
-  case "$(ps -o stat= -p "$ADOPTED_PID" 2>/dev/null || true)" in
-    "" | *Z*) return 1 ;;
+# a zombie does not count as running. Without ps to tell, trust kill -0.
+server_running() {
+  [ -n "$1" ] && kill -0 "$1" 2>/dev/null || return 1
+  case "$(ps -o stat= -p "$1" 2>/dev/null || true)" in
+    *Z*) return 1 ;;
   esac
 }
 resolve_default_runtime_port() {
@@ -701,14 +701,14 @@ fi
 if [ "$REMOTE_MANAGED" = "external" ]; then
   # A server adopted above has just answered. While it is still alive, probing
   # it again could catch a momentary stall and launch a second server beside it.
-  if adopted_server_running; then
+  if server_running "$ADOPTED_PID"; then
     :
   elif [ -z "$REMOTE_PORT" ] || ! wait_ready "@@T3_REUSE_READY_TIMEOUT_MS@@"; then
     REMOTE_PID=""
     REMOTE_PORT=""
     REMOTE_MANAGED=""
   fi
-elif [ -n "$REMOTE_PID" ] && [ -n "$REMOTE_PORT" ] && kill -0 "$REMOTE_PID" 2>/dev/null; then
+elif [ -n "$REMOTE_PID" ] && [ -n "$REMOTE_PORT" ] && server_running "$REMOTE_PID"; then
   # Reconnect owns the local tunnel, not the lifetime of an already running
   # server. A changed runner is the update path and still replaces it.
   if [ "$RUNNER_CHANGED" -eq 1 ]; then

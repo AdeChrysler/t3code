@@ -251,7 +251,7 @@ describe("ssh tunnel scripts", () => {
 
     assert.include(
       launch,
-      '[ -n "$REMOTE_PID" ] && [ -n "$REMOTE_PORT" ] && kill -0 "$REMOTE_PID" 2>/dev/null',
+      '[ -n "$REMOTE_PID" ] && [ -n "$REMOTE_PORT" ] && server_running "$REMOTE_PID"',
     );
     assert.include(launch, "RUNNER_CHANGED=1");
     assert.include(launch, "ensure_remote_node_path()");
@@ -1079,6 +1079,7 @@ server.listen(Number(flag("--port")), "127.0.0.1", () => {
         return Number(Option.getOrThrow(port));
       });
     return {
+      home,
       stateDir,
       launch,
       readManagedPid,
@@ -1192,6 +1193,47 @@ server.listen(Number(flag("--port")), "127.0.0.1", () => {
         const replacementPid = yield* readManagedPid;
         assert.notEqual(replacementPid, previousPid);
         assert.isFalse(isAlive(previousPid));
+        assert.isTrue(isAlive(replacementPid));
+      }).pipe(Effect.provide(NodeServices.layer)),
+    60_000,
+  );
+
+  it.effect.skipIf(windowsHost)(
+    "replaces a managed server that exited but was not reaped",
+    () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+        const { home, stateDir, readManagedPid, runLaunch, launchManaged } = yield* prepareLaunch;
+        const { launched, pid } = yield* launchManaged;
+        process.kill(pid, "SIGKILL");
+
+        // A crashed server whose parent never reaps it stays a zombie, which
+        // kill -0 still reports. Its pid file and runtime record keep naming it.
+        const parent = yield* spawner.spawn(
+          ChildProcess.make("sh", ["-c", "sleep 600 & echo $!; exec sleep 600"]),
+        );
+        const zombie = Number(
+          Option.getOrThrow(
+            yield* parent.stdout.pipe(Stream.decodeText(), Stream.splitLines, Stream.runHead),
+          ),
+        );
+        process.kill(zombie, "SIGKILL");
+        assert.include((yield* runScript(home, ["-c", `ps -o stat= -p ${zombie}`])).stdout, "Z");
+        yield* fs.writeFileString(`${stateDir}/pid`, `${zombie}\n`);
+        yield* fs.writeFileString(
+          `${home}/.t3/userdata/server-runtime.json`,
+          JSON.stringify({
+            version: 1,
+            pid: zombie,
+            port: launched.remotePort,
+            origin: `http://127.0.0.1:${launched.remotePort}`,
+          }),
+        );
+
+        assert.equal((yield* runLaunch).serverKind, "managed");
+        const replacementPid = yield* readManagedPid;
+        assert.notEqual(replacementPid, zombie);
         assert.isTrue(isAlive(replacementPid));
       }).pipe(Effect.provide(NodeServices.layer)),
     60_000,
