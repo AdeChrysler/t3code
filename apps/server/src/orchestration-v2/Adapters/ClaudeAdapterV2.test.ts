@@ -13800,6 +13800,7 @@ describe("ClaudeAdapterV2 background wake turns", () => {
     { backgrounding: "succeeds" },
     { backgrounding: "fails" },
     { backgrounding: "never answers" },
+    { backgrounding: "answers after the turn ended" },
   ] as const)(
     "moves the root's foreground subagents to the background before a steer ($backgrounding)",
     ({ backgrounding }) =>
@@ -13809,20 +13810,24 @@ describe("ClaudeAdapterV2 background wake turns", () => {
           const NESTED_TOOL_USE_ID = "toolu-steer-nested";
           const FINISHED_TOOL_USE_ID = "toolu-steer-finished";
           const calls: Array<string> = [];
+          // The root turn settles while the move is still unanswered.
+          let endTurnFirst: Effect.Effect<void> = Effect.void;
           const harness = yield* makeWakeHarnessWithOptions({
             backgroundTasks: (toolUseId) =>
               Effect.sync(() => calls.push(toolUseId)).pipe(
                 Effect.andThen(
-                  backgrounding === "fails"
-                    ? Effect.fail(
-                        new ClaudeAdapterV2.ClaudeAgentSdkQueryRunnerError({
-                          method: "backgroundTasks",
-                          cause: new Error("Background tasks are disabled in this session."),
-                        }),
-                      )
-                    : backgrounding === "never answers"
-                      ? Effect.never
-                      : Effect.succeed(true),
+                  backgrounding === "answers after the turn ended"
+                    ? Effect.suspend(() => endTurnFirst).pipe(Effect.as(true))
+                    : backgrounding === "fails"
+                      ? Effect.fail(
+                          new ClaudeAdapterV2.ClaudeAgentSdkQueryRunnerError({
+                            method: "backgroundTasks",
+                            cause: new Error("Background tasks are disabled in this session."),
+                          }),
+                        )
+                      : backgrounding === "never answers"
+                        ? Effect.never
+                        : Effect.succeed(true),
                 ),
               ),
           });
@@ -13837,7 +13842,14 @@ describe("ClaudeAdapterV2 background wake turns", () => {
             attachments: [],
           });
           yield* harness.runtime.startTurn(input);
+          endTurnFirst = Queue.offer(
+            harness.sdkMessages,
+            makeResultFrame({ uuid: "00000000-0000-4000-8000-000000000a10", result: "Done." }),
+          ).pipe(
+            Effect.andThen(awaitUntil(() => harness.terminalEvents().length === 1, "turn end")),
+          );
           const foregroundTaskStarted = (task: {
+            readonly spawnDepth?: number;
             readonly taskId: string;
             readonly toolUseId: string;
             readonly uuid: string;
@@ -13852,6 +13864,7 @@ describe("ClaudeAdapterV2 background wake turns", () => {
               is_backgrounded: false,
               task_type: "local_agent",
               prompt: "Audit.",
+              ...(task.spawnDepth === undefined ? {} : { spawn_depth: task.spawnDepth }),
               uuid: task.uuid,
               session_id: WAKE_NATIVE_SESSION,
             });
@@ -13897,6 +13910,13 @@ describe("ClaudeAdapterV2 background wake turns", () => {
               toolUseId: NESTED_TOOL_USE_ID,
               uuid: "00000000-0000-4000-8000-000000000a05",
             }),
+            // Nested too, though its launch never reached the adapter.
+            foregroundTaskStarted({
+              taskId: "task-steer-deep",
+              toolUseId: "toolu-steer-deep",
+              spawnDepth: 2,
+              uuid: "00000000-0000-4000-8000-000000000a11",
+            }),
           ]) {
             yield* Queue.offer(harness.sdkMessages, frame);
           }
@@ -13912,6 +13932,7 @@ describe("ClaudeAdapterV2 background wake turns", () => {
           yield* awaitUntil(
             () =>
               latestSubagent("task-steer-nested")?.status === "running" &&
+              latestSubagent("task-steer-deep")?.status === "running" &&
               latestSubagent("task-steer-foreground")?.status === "running" &&
               latestSubagent("task-steer-finished")?.status === "completed",
             "subagents registered",
@@ -13940,12 +13961,19 @@ describe("ClaudeAdapterV2 background wake turns", () => {
             assert.equal(harness.offeredMessages.length, offered);
             yield* TestClock.adjust("5 seconds");
           }
-          yield* Fiber.join(steering);
+          const steered = yield* Fiber.await(steering);
 
-          // Only the root's running subagent moves: the nested one follows its
-          // owner and the finished one has nothing left to move. A refused or
-          // unanswered move still lets the steer through.
+          // Only the root's running subagent moves: the nested ones follow
+          // their owner and the finished one has nothing left to move.
           assert.deepEqual(calls, [FOREGROUND_TOOL_USE_ID]);
+          if (backgrounding === "answers after the turn ended") {
+            // The steer is refused, so the orchestrator starts its follow-up turn.
+            assert.isTrue(Exit.isFailure(steered));
+            assert.equal(harness.offeredMessages.length, offered);
+            return;
+          }
+          // A refused or unanswered move still lets the steer through.
+          assert.isTrue(Exit.isSuccess(steered));
           assert.equal(harness.offeredMessages.length, offered + 1);
           assert.equal(harness.offeredMessages.at(-1)?.priority, "now");
           if (backgrounding !== "succeeds") return;

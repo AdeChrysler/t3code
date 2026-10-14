@@ -8847,37 +8847,52 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
         const backgroundForegroundSubagents = Effect.fnUntraced(function* (
           live: ClaudeLiveQueryContext,
         ) {
-          const foreground = Array.from(
-            (yield* Ref.get(sessionSubagentsByTaskId)).values(),
-          ).flatMap((subagent) =>
-            subagent.runToolUseId !== null &&
-            subagent.task.status === "running" &&
-            subagent.task.parentNodeId === subagent.rootNodeId &&
-            !live.subagentsFromEarlierProcesses.has(subagent)
-              ? [{ subagent, toolUseId: subagent.runToolUseId }]
-              : [],
-          );
+          const foreground: Array<{
+            readonly taskId: string;
+            readonly toolUseId: string;
+          }> = [];
+          for (const [taskId, subagent] of yield* Ref.get(sessionSubagentsByTaskId)) {
+            const toolUseId = subagent.runToolUseId;
+            if (
+              toolUseId === null ||
+              subagent.task.status !== "running" ||
+              subagent.task.parentNodeId !== subagent.rootNodeId ||
+              live.subagentsFromEarlierProcesses.has(subagent) ||
+              // A nested launch whose owner was not known yet falls back to
+              // the root as its parent node; its spawn depth still marks it.
+              (yield* isNestedSubagentTask(taskId))
+            ) {
+              continue;
+            }
+            foreground.push({ taskId, toolUseId });
+          }
           // Backgrounding is refused when the session disables background
           // tasks, and the SDK puts no deadline on the request. Either way the
           // steer still goes through, as it did before.
           yield* Effect.forEach(
             foreground,
-            ({ subagent, toolUseId }) =>
+            ({ taskId, toolUseId }) =>
               live.query.backgroundTasks(toolUseId).pipe(
                 Effect.timeout("5 seconds"),
                 // Now a background subagent: its end wakes the root like one
-                // Claude started in the background.
-                Effect.flatMap((moved) => {
-                  const taskId = subagent.task.nativeTaskRef?.nativeId;
-                  return moved && typeof taskId === "string"
-                    ? Ref.update(backgroundedSubagentTaskIds, (current) =>
-                        new Set(current).add(taskId),
+                // Claude started in the background. One that already ended
+                // while the move was answered has nothing left to report.
+                Effect.flatMap((moved) =>
+                  moved
+                    ? Ref.get(sessionSubagentsByTaskId).pipe(
+                        Effect.flatMap((registry) =>
+                          registry.get(taskId)?.task.status === "running"
+                            ? Ref.update(backgroundedSubagentTaskIds, (current) =>
+                                new Set(current).add(taskId),
+                              )
+                            : Effect.void,
+                        ),
                       )
-                    : Effect.void;
-                }),
+                    : Effect.void,
+                ),
                 Effect.catch((cause) =>
                   Effect.logWarning("orchestration-v2.claude-steer-background-subagent-failed", {
-                    taskId: subagent.task.nativeTaskRef?.nativeId,
+                    taskId,
                     toolUseId,
                     cause,
                   }),
@@ -8914,12 +8929,24 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
               fileSystem,
               skillNames: yield* userInvocableSkillNames(currentTurn.input.runtimePolicy.cwd),
             });
+            yield* backgroundForegroundSubagents(existing);
+            // The turn can end while the moves are answered. A steer offered
+            // then would start a new turn the orchestrator never asked for, so
+            // the steer fails and the orchestrator starts the follow-up turn.
+            if (
+              (yield* Ref.get(activeTurn))?.providerTurnId !== turnInput.providerTurnId ||
+              (yield* Ref.get(queryContext)) !== existing
+            ) {
+              return yield* new ProviderAdapter.ProviderAdapterProtocolError({
+                driver: CLAUDE_PROVIDER,
+                detail: `Claude provider turn ${turnInput.providerTurnId} ended before the steer was sent.`,
+              });
+            }
             yield* Ref.update(steeredTurns, (current) => {
               const next = new Set(current);
               next.add(turnInput.providerTurnId);
               return next;
             });
-            yield* backgroundForegroundSubagents(existing);
             yield* existing.query.offer(userMessage);
           },
           (effect, turnInput) =>
