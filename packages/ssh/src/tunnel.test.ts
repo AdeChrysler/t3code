@@ -1029,6 +1029,7 @@ server.listen(Number(flag("--port")), "127.0.0.1", () => {
       .pipe(Effect.map((pid) => Number(pid.trim())));
     // Launched servers outlive the script, so stop each PID the script
     // recorded, including one it recorded just before a failed assertion.
+    // SIGKILL also ends a server a test left stopped.
     const launchedPids: Array<number> = [];
     yield* Effect.addFinalizer(() =>
       readManagedPid.pipe(
@@ -1036,12 +1037,13 @@ server.listen(Number(flag("--port")), "127.0.0.1", () => {
         Effect.orElseSucceed(() => launchedPids),
         Effect.map((pids) => {
           for (const pid of pids) {
-            if (isAlive(pid)) process.kill(pid);
+            if (isAlive(pid)) process.kill(pid, "SIGKILL");
           }
         }),
       ),
     );
-    const runLaunch = runScript(home, [launch, "test-state"]).pipe(
+    const runLaunchScript = runScript(home, [launch, "test-state"]);
+    const runLaunch = runLaunchScript.pipe(
       Effect.map((result) => {
         assert.equal(result.exitCode, 0, result.stderr);
         return launchResult(result.stdout);
@@ -1076,7 +1078,15 @@ server.listen(Number(flag("--port")), "127.0.0.1", () => {
         );
         return Number(Option.getOrThrow(port));
       });
-    return { stateDir, readManagedPid, runLaunch, launchManaged, startDefaultHomeServer };
+    return {
+      stateDir,
+      launch,
+      readManagedPid,
+      runLaunchScript,
+      runLaunch,
+      launchManaged,
+      startDefaultHomeServer,
+    };
   });
 
   it.effect.skipIf(windowsHost)(
@@ -1113,6 +1123,76 @@ server.listen(Number(flag("--port")), "127.0.0.1", () => {
         });
         assert.isFalse(yield* isListening(launched.remotePort));
         assert.isFalse(yield* fs.exists(`${stateDir}/pid`));
+      }).pipe(Effect.provide(NodeServices.layer)),
+    60_000,
+  );
+
+  // A stopped process keeps its listener but answers nothing, like a server
+  // stuck in a long SQLite stall.
+  it.effect.skipIf(windowsHost)(
+    "waits for its busy managed server instead of replacing it",
+    () =>
+      Effect.gen(function* () {
+        const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+        const { readManagedPid, runLaunch, launchManaged } = yield* prepareLaunch;
+        const { launched, pid } = yield* launchManaged;
+
+        // It resumes after the two 2-second probes that used to replace it.
+        process.kill(pid, "SIGSTOP");
+        yield* spawner.spawn(ChildProcess.make("sh", ["-c", `sleep 5; kill -CONT ${pid}`]));
+        assert.deepEqual(yield* runLaunch, launched);
+        assert.equal(yield* readManagedPid, pid);
+        assert.isTrue(isAlive(pid));
+      }).pipe(Effect.provide(NodeServices.layer)),
+    60_000,
+  );
+
+  it.effect.skipIf(windowsHost)(
+    "fails without stopping a managed server that never becomes ready",
+    () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const { stateDir, launch, readManagedPid, runLaunchScript, launchManaged } =
+          yield* prepareLaunch;
+        const { launched, pid } = yield* launchManaged;
+
+        // Shorten the one-minute readiness budget so the test stays fast.
+        const script = yield* fs.readFileString(launch);
+        assert.include(script, 'wait_ready "60000"');
+        yield* fs.writeFileString(
+          launch,
+          script.replaceAll('wait_ready "60000"', 'wait_ready "1500"'),
+        );
+        process.kill(pid, "SIGSTOP");
+        const result = yield* runLaunchScript;
+        assert.equal(result.exitCode, 1, result.stdout);
+        assert.include(result.stderr, "the server was left running");
+        assert.isTrue(isAlive(pid));
+        assert.equal(yield* readManagedPid, pid);
+        assert.equal(
+          (yield* fs.readFileString(`${stateDir}/port`)).trim(),
+          `${launched.remotePort}`,
+        );
+        assert.equal((yield* fs.readFileString(`${stateDir}/managed`)).trim(), "managed");
+      }).pipe(Effect.provide(NodeServices.layer)),
+    60_000,
+  );
+
+  it.effect.skipIf(windowsHost)(
+    "still replaces its managed server when the runner changes",
+    () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const { stateDir, readManagedPid, runLaunch, launchManaged } = yield* prepareLaunch;
+        const { pid: previousPid } = yield* launchManaged;
+
+        // A different runner on disk means the client updated: replace the server.
+        yield* fs.writeFileString(`${stateDir}/run-t3.sh`, "# previous runner\n");
+        assert.equal((yield* runLaunch).serverKind, "managed");
+        const replacementPid = yield* readManagedPid;
+        assert.notEqual(replacementPid, previousPid);
+        assert.isFalse(isAlive(previousPid));
+        assert.isTrue(isAlive(replacementPid));
       }).pipe(Effect.provide(NodeServices.layer)),
     60_000,
   );
