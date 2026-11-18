@@ -10,6 +10,7 @@ import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it } from "@effect/vitest";
 import { ProviderSessionId, ThreadId } from "@t3tools/contracts";
+import * as Cause from "effect/Cause";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Deferred from "effect/Deferred";
@@ -29,6 +30,7 @@ import { signalProcessGroup } from "@t3tools/provider-core/server/processGroup";
 import * as PortScanner from "../../preview/PortScanner.ts";
 import {
   ClaudeAgentSdkQueryRunner,
+  ClaudeAgentSdkQueryRunnerError,
   type ClaudeAgentSdkQueryOpenInput,
   layerQueryRunner,
   spawnClaudeProcessGroup,
@@ -913,4 +915,104 @@ describe.skipIf(HostProcess.Platform.defaultValue() === "win32")("Claude CLI pro
       assert.equal(runningAgents, 0);
     }).pipe(Effect.provide(runner));
   });
+});
+
+const forkIn = (environment: NodeJS.ProcessEnv, label: string) =>
+  Effect.gen(function* () {
+    const runner = yield* ClaudeAgentSdkQueryRunner;
+    return yield* runner.forkSession({
+      sessionId: FORK_SESSION_ID,
+      options: { dir: "/repo" },
+      environment,
+      threadId: ThreadId.make(`thread-fork-${label}`),
+      providerSessionId: ProviderSessionId.make(`session-fork-${label}`),
+    });
+  });
+
+// The server may itself run with CLAUDE_CONFIG_DIR set by a launcher, so its
+// default home is whatever it inherited.
+const serverConfigDir = Effect.gen(function* () {
+  const environment = yield* HostProcess.Environment;
+  const homeDirectory = yield* HostProcess.HomeDirectory;
+  return NodePath.resolve(environment.CLAUDE_CONFIG_DIR ?? NodePath.join(homeDirectory, ".claude"));
+});
+
+describe("Claude session fork across homes", () => {
+  it.effect("forks sessions of instances with different homes at the same time", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const fileSystem = yield* FileSystem.FileSystem;
+        const serverEnvironmentBefore = { ...(yield* HostProcess.Environment) };
+        const homes = yield* Effect.forEach(["a", "b", "c"], (name) =>
+          Effect.gen(function* () {
+            const configDir = yield* fileSystem.makeTempDirectoryScoped({
+              prefix: `t3-claude-fork-${name}-`,
+            });
+            return { name, configDir, projectDir: yield* writeClaudeSession(configDir) };
+          }),
+        );
+
+        const forks = yield* Effect.forEach(
+          homes,
+          (home) =>
+            forkIn(
+              { ...process.env, CLAUDE_CONFIG_DIR: home.configDir },
+              `concurrent-${home.name}`,
+            ),
+          { concurrency: "unbounded" },
+        );
+
+        for (const [index, home] of homes.entries()) {
+          assert.deepEqual(
+            (yield* fileSystem.readDirectory(home.projectDir)).toSorted(),
+            [`${FORK_SESSION_ID}.jsonl`, `${forks[index]!.sessionId}.jsonl`].toSorted(),
+          );
+        }
+        assert.equal(new Set(forks.map((fork) => fork.sessionId)).size, homes.length);
+        assert.deepEqual(yield* HostProcess.Environment, serverEnvironmentBefore);
+      }).pipe(Effect.provide(forkRunnerLayer)),
+    ).pipe(Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
+  );
+
+  it.effect("forks in the server when the instance reads the server's own config dir", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const inProcessFork = vi
+          .spyOn(ClaudeSdk, "forkSession")
+          .mockResolvedValue({ sessionId: "forked-in-process" });
+        yield* Effect.addFinalizer(() => Effect.sync(() => inProcessFork.mockRestore()));
+        const inherited = { ...process.env };
+        const explicit = { ...process.env, CLAUDE_CONFIG_DIR: `${yield* serverConfigDir}/` };
+
+        const forks = [yield* forkIn(inherited, "inherited"), yield* forkIn(explicit, "explicit")];
+
+        assert.deepEqual(
+          forks.map((fork) => fork.sessionId),
+          ["forked-in-process", "forked-in-process"],
+        );
+        assert.equal(inProcessFork.mock.calls.length, 2);
+      }).pipe(Effect.provide(forkRunnerLayer)),
+    ).pipe(Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
+  );
+
+  it.effect("reports a missing session from the instance's home as a fork failure", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const fileSystem = yield* FileSystem.FileSystem;
+        const configDir = yield* fileSystem.makeTempDirectoryScoped({
+          prefix: "t3-claude-fork-empty-",
+        });
+
+        const exit = yield* Effect.exit(
+          forkIn({ ...process.env, CLAUDE_CONFIG_DIR: configDir }, "missing"),
+        );
+
+        // The worker's stderr starts with the SDK's minified source line, and a
+        // pipe can end before the reason, so only the failing call is checked.
+        const failure = Exit.isFailure(exit) ? Cause.squash(exit.cause) : undefined;
+        assert.instanceOf(failure, ClaudeAgentSdkQueryRunnerError);
+        assert.equal(failure.method, "forkSession");
+      }).pipe(Effect.provide(forkRunnerLayer)),
+    ).pipe(Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
+  );
 });
