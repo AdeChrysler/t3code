@@ -24856,6 +24856,69 @@ describe("ClaudeAdapterV2 background wake turns", () => {
       }).pipe(Effect.scoped, Effect.provide(goalTestLayer)),
     );
 
+    it.effect("ignores a late check of a goal that was replaced or cleared", () =>
+      Effect.gen(function* () {
+        const harness = yield* makeWakeHarness;
+        const first = "the old objective";
+        const second = "the release notes are written";
+        yield* startGoalTurn(harness, { attempt: "goal-mirror-late", text: `/goal ${first}` });
+        yield* offerAll(harness, [
+          goalRecords([goalSetRecord(first)]),
+          goalRecords([goalUnmetRecord(first, "Not yet.")]),
+          // A new goal replaces the first; the first one's evaluator answers late.
+          goalRecords([goalSetRecord(second)]),
+          goalRecords([goalUnmetRecord(first, "Late check.")]),
+          // The new goal is cleared; its own evaluator answers late too.
+          goalRecords([goalClearedRecord(second)]),
+          goalRecords([goalUnmetRecord(second, "Late check.")]),
+          makeResultFrame({ uuid: "goal-mirror-late-result", result: "Done." }),
+        ]);
+        yield* Queue.take(harness.terminalReceipts);
+        const goals = harness.events.flatMap((event) =>
+          event.type === "provider_thread.updated" ? [event.providerThread.goal] : [],
+        );
+        const replacedAt = goals.findIndex((goal) => goal?.objective === second);
+        assert.isAtLeast(replacedAt, 0);
+        assert.isFalse(goals.slice(replacedAt).some((goal) => goal?.objective === first));
+        assert.isNull(goals.at(-1));
+      }).pipe(Effect.scoped, Effect.provide(goalTestLayer)),
+    );
+
+    it.effect.each([{ late: "unmet" }, { late: "met" }])(
+      "keeps the new goal when the CLI acknowledges it before a late $late check of the old one",
+      ({ late }) =>
+        Effect.gen(function* () {
+          const harness = yield* makeWakeHarness;
+          const first = "the old objective";
+          const second = "the release notes are written";
+          yield* startGoalTurn(harness, {
+            attempt: `goal-mirror-ack-${late}`,
+            text: `/goal ${second}`,
+          });
+          yield* offerAll(harness, [
+            syntheticFrame(`goal-mirror-ack-${late}-set-a`, `Goal set: ${first}`),
+            goalRecords([goalSetRecord(first)]),
+            goalRecords([goalUnmetRecord(first, "Not yet.")]),
+            // Claude Code acknowledges `/goal B` before it writes B's sentinel record.
+            syntheticFrame(`goal-mirror-ack-${late}-set-b`, `Goal set: ${second}`),
+            goalRecords([goalSetRecord(second)]),
+            // The evaluator of the replaced goal answers late.
+            goalRecords([
+              late === "met" ? goalMetRecord(first) : goalUnmetRecord(first, "Late check."),
+            ]),
+            makeResultFrame({ uuid: `goal-mirror-ack-${late}-result`, result: "Working." }),
+          ]);
+          yield* Queue.take(harness.terminalReceipts);
+          const goals = harness.events.flatMap((event) =>
+            event.type === "provider_thread.updated" ? [event.providerThread.goal] : [],
+          );
+          const replacedAt = goals.findIndex((goal) => goal?.objective === second);
+          assert.isAtLeast(replacedAt, 0);
+          assert.isFalse(goals.slice(replacedAt).some((goal) => goal?.objective === first));
+          assert.deepEqual(goals.at(-1), { objective: second, status: "active", checks: 0 });
+        }).pipe(Effect.scoped, Effect.provide(goalTestLayer)),
+    );
+
     it.effect("keeps a goal active after a command turn with no model output", () =>
       Effect.gen(function* () {
         const harness = yield* makeWakeHarness;
@@ -25125,3 +25188,61 @@ function claudeStreamEventFrame(index: number): SDKMessage {
     session_id: "s",
   } as SDKMessage;
 }
+
+describe("ClaudeAdapterV2 goal records after a goal command", () => {
+  const records = (
+    ...list: ReadonlyArray<ClaudeAdapterV2.ClaudeGoalStatusRecord>
+  ): ClaudeAdapterV2.ClaudeGoalRecordState =>
+    list.reduce(ClaudeAdapterV2.nextClaudeGoalStateFromRecord, {
+      goal: null,
+      retired: new Set<string>(),
+    });
+  const set = (condition: string) =>
+    ({ type: "goal_status", met: false, sentinel: true, condition }) as const;
+  const cleared = (condition: string) =>
+    ({ type: "goal_status", met: true, sentinel: true, condition }) as const;
+  const unmet = (condition: string, reason: string) =>
+    ({ type: "goal_status", met: false, condition, reason }) as const;
+  const met = (condition: string) =>
+    ({ type: "goal_status", met: true, condition, reason: "It holds." }) as const;
+
+  it("keeps a cleared goal cleared when a late check of it arrives", () => {
+    const state = records(set("A"), unmet("A", "one"), cleared("A"), unmet("A", "late"));
+    assert.equal(state.goal, null);
+  });
+
+  it("keeps the new goal when a late check of the goal it replaced arrives", () => {
+    const state = records(set("A"), unmet("A", "one"), set("B"), unmet("A", "late"));
+    assert.deepEqual(state.goal, { objective: "B", status: "active", checks: 0 });
+    assert.deepEqual(records(set("A"), set("B"), unmet("B", "one")).goal, {
+      objective: "B",
+      status: "active",
+      checks: 1,
+      lastCheck: "one",
+    });
+  });
+
+  it("keeps a met goal met when a late check of it arrives", () => {
+    const state = records(set("A"), met("A"), unmet("A", "late"));
+    assert.deepEqual(state.goal, { objective: "A", status: "complete", checks: 0 });
+  });
+
+  it("counts checks again when the same goal is set again after a clear", () => {
+    const state = records(set("A"), cleared("A"), set("A"), unmet("A", "again"));
+    assert.deepEqual(state.goal, {
+      objective: "A",
+      status: "active",
+      checks: 1,
+      lastCheck: "again",
+    });
+  });
+
+  it("keeps only the latest 16 retired objectives", () => {
+    const goals = Array.from({ length: 20 }, (_, index) => `goal ${index}`);
+    const state = records(...goals.map(set), cleared("goal 19"));
+    assert.equal(state.retired.size, 16);
+    assert.isTrue(state.retired.has("goal 19"));
+    assert.isTrue(state.retired.has("goal 4"));
+    assert.isFalse(state.retired.has("goal 3"));
+  });
+});

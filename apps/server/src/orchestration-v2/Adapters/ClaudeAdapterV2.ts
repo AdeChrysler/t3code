@@ -2775,6 +2775,61 @@ function nextClaudeGoalFromRecord(
   };
 }
 
+/** A native thread's goal plus the objectives that no longer take verdicts. */
+export interface ClaudeGoalRecordState {
+  readonly goal: OrchestrationV2ProviderGoal | null;
+  /**
+   * Goals a clear, a replacing `/goal`, or a final verdict ended. A late check of one (an
+   * evaluator the clear overtook) must not bring it back; setting the same condition revives it.
+   */
+  readonly retired: ReadonlySet<string>;
+}
+
+// Only an evaluator still in flight writes a late check, so a few recent objectives suffice.
+const MAX_RETIRED_CLAUDE_GOALS = 16;
+
+/** The retired objectives after one goal ends and another (or the same) starts. */
+function retireClaudeGoal(
+  retired: ReadonlySet<string>,
+  ended: string | undefined,
+  started: string | undefined,
+): ReadonlySet<string> {
+  const next = new Set(retired);
+  if (ended !== undefined) {
+    next.delete(ended);
+    next.add(ended);
+  }
+  if (started !== undefined) next.delete(started);
+  for (const oldest of next) {
+    if (next.size <= MAX_RETIRED_CLAUDE_GOALS) break;
+    next.delete(oldest);
+  }
+  return next;
+}
+
+export function nextClaudeGoalStateFromRecord(
+  state: ClaudeGoalRecordState,
+  record: ClaudeGoalStatusRecord,
+): ClaudeGoalRecordState {
+  const objective = record.condition.trim();
+  if (objective.length === 0) return state;
+  if (record.sentinel === true) {
+    const replaced =
+      !record.met && state.goal !== null && state.goal.objective !== objective
+        ? state.goal.objective
+        : undefined;
+    const retired = record.met
+      ? retireClaudeGoal(state.retired, objective, undefined)
+      : retireClaudeGoal(state.retired, replaced, objective);
+    return { goal: nextClaudeGoalFromRecord(state.goal, record), retired };
+  }
+  if (state.retired.has(objective)) return state;
+  const goal = nextClaudeGoalFromRecord(state.goal, record);
+  return record.met || record.failed === true
+    ? { goal, retired: retireClaudeGoal(state.retired, objective, undefined) }
+    : { goal, retired: state.retired };
+}
+
 const providerGoalsEqual = Schema.toEquivalence(Schema.NullOr(OrchestrationV2ProviderGoal));
 
 function normalizeClaudeResultText(text: string): string {
@@ -6101,6 +6156,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
           new Map<string, OrchestrationV2ProviderThread>(),
         );
         const goalsByNativeThread = new Map<string, OrchestrationV2ProviderGoal | null>();
+        const retiredGoalsByNativeThread = new Map<string, ReadonlySet<string>>();
         // The title T3 last applied to each native session, so a turn renames it only when the
         // thread title changed. A native `/rename` T3 never applied survives later turns.
         const appliedSessionTitles = new Map<string, string>();
@@ -6864,7 +6920,20 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             goalCheckedTurns.add(input.context.providerTurnId);
           }
           const next = nextClaudeGoal(current, input.message, input.live.goalStatusMirrored);
-          if (next !== undefined) yield* writeClaudeGoal(input.live.nativeThreadId, next);
+          if (next === undefined) return;
+          // The CLI acknowledges a replacing `/goal` before its sentinel record, so the goal it
+          // replaced must be retired here, or a late check of it would bring it back.
+          if (current !== null && current.objective !== next?.objective) {
+            retiredGoalsByNativeThread.set(
+              input.live.nativeThreadId,
+              retireClaudeGoal(
+                retiredGoalsByNativeThread.get(input.live.nativeThreadId) ?? new Set<string>(),
+                current.objective,
+                next?.objective,
+              ),
+            );
+          }
+          yield* writeClaudeGoal(input.live.nativeThreadId, next);
         });
 
         /**
@@ -6884,13 +6953,12 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             return;
           }
           live.goalStatusMirrored = true;
-          yield* writeClaudeGoal(
-            live.nativeThreadId,
-            message.records.reduce(
-              nextClaudeGoalFromRecord,
-              goalsByNativeThread.get(live.nativeThreadId) ?? null,
-            ),
-          );
+          const next = message.records.reduce(nextClaudeGoalStateFromRecord, {
+            goal: goalsByNativeThread.get(live.nativeThreadId) ?? null,
+            retired: retiredGoalsByNativeThread.get(live.nativeThreadId) ?? new Set<string>(),
+          });
+          retiredGoalsByNativeThread.set(live.nativeThreadId, next.retired);
+          yield* writeClaudeGoal(live.nativeThreadId, next.goal);
         });
 
         const rememberOpaqueTasks = (tasks: ReadonlyArray<OrchestrationV2PendingBackgroundTask>) =>
