@@ -323,6 +323,7 @@ its progress.
   turn and starts the goal, unless you queue it. `/goal clear` and `/goal pause`
   stop the turn only when it is working on the goal. Other goal commands wait for
   the turn to end.
+- Claude ends a goal it judges impossible, and the goal row goes away.
 
 ## Context in your message
 
