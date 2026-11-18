@@ -2,6 +2,20 @@
 @layer theme, base, clerk, components, utilities;
 @import "tailwindcss";
 
+/* Personal Zenith client branding; these pigments never reach other clients. */
+svg[data-stage-art="nightly"] {
+  --stage-night-bottom: #071326;
+  --stage-night-mid: #0c2140;
+  --stage-night-top: #142e55;
+  --stage-night-glow-highlight: #80acdc;
+  --stage-night-glow-secondary: #34679f;
+  --stage-night-highlight: #5b8cbd;
+  --stage-night-secondary: #244a79;
+  --stage-night-tertiary: #132d50;
+  --stage-night-line: #a4bad4;
+  --stage-night-sparkle: #d3e4f7;
+}
+
 @custom-variant dark (&:is(.dark, .dark *));
 @custom-variant light (&:not(.dark, .dark *));
 /* Window Controls Overlay: active when Electron exposes native titlebar control geometry. */
